@@ -15,12 +15,40 @@ Motif-specific targeting of protein-protein interactions (PPIs) is crucial for d
 
 ---
 
-# 0. Conda Environment Preparation
+# 0. Installation
 
-```
+moPPIt is now installable as a Python package. The BindEvaluator architecture names used by the checkpoints are preserved (`esm_model`, `repeated_module`, final attention/FFN layers, and output projection), so existing `.ckpt` weights can still be loaded for prediction as long as the model hyperparameters match the checkpoint.
+
+For Blackwell / CUDA 13+ machines, install a PyTorch build that matches the remote driver and CUDA runtime before installing moPPIt. This repository does not compile custom CUDA extensions; GPU compatibility comes from the installed PyTorch wheel or container.
+
+```bash
 conda env create -f environment.yml
-
 conda activate moppit
+python -m pip install --upgrade pip
+
+# Install the CUDA 13.x PyTorch command published for your PyTorch release.
+# If your remote image already provides CUDA 13+ PyTorch, skip this line.
+python -m pip install torch torchvision torchaudio --index-url <PYTORCH_CUDA_13_WHEEL_INDEX>
+
+# Prediction and generation install.
+python -m pip install -e .
+
+# Or include training utilities such as wandb.
+python -m pip install -e ".[train]"
+```
+
+Verify the GPU build before running checkpoint prediction:
+
+```bash
+python - <<'PY'
+import torch
+
+print("torch", torch.__version__)
+print("cuda", torch.version.cuda)
+print("available", torch.cuda.is_available())
+if torch.cuda.is_available():
+  print("device", torch.cuda.get_device_name(0))
+PY
 ```
 
 # 1. Dataset Preparation
@@ -59,12 +87,12 @@ Protein-protein interaction binding sites can be predicted using the pre-trained
 
 Peptide-protein interaction binding sites can be predicted using the fine-tuned BindEvaluator (`model_path/finetuned_BindEvaluator.ckpt`)
 
-We provide an example script to use BindEvaluator to predict binding sites (`scripts/predict.sh`)
+We provide an example script to use BindEvaluator to predict binding sites (`scripts/predict.sh`). After installation, use the `moppit-predict` console command. The legacy `python predict_motifs.py` wrapper is still available from the repository checkout.
 
 NOTE: amino acid indices start from 0 on a protein sequence
 
 ``` txt
-usage: python predict_motifs.py -sm MODEL_PATH -target Target -binder Binder
+usage: moppit-predict -sm MODEL_PATH -target Target -binder Binder
                         [-gt] [-n_layers] [-d_model] [-d_hidden] [-n_head] [-d_inner]
 
 arguments:
@@ -77,9 +105,9 @@ arguments:
 
 # 4. Motif-Specific Binder Generation
 
-We provide an example script to use moPPIt for generating motif-specific binders based on a target sequence (`scripts/generation.sh`)
+We provide an example script to use moPPIt for generating motif-specific binders based on a target sequence (`scripts/generation.sh`). After installation, use the `moppit-generate` console command. The legacy `python moppit.py` wrapper is still available from the repository checkout.
 ``` txt
-usage: python moppit.py -sm MODEL_PATH --protein_seq PROTEIN --peptide_length LENGTH --motif MOTIF
+usage: moppit-generate -sm MODEL_PATH --protein_seq PROTEIN --peptide_length LENGTH --motif MOTIF
                         [--top_k] [--num_binders] [--num_display] [-max_iterations] [-n_layers] [-d_model] [-d_hidden] [-n_head] [-d_inner]
 
 arguments:
@@ -103,7 +131,7 @@ We provide the Python script to run PeptiDerive locally.
 
 NOTE: In PeptiDerive results, amino acid indices start from 1 on protein sequences.
 ``` txt
-usage: python peptiderive.py --pdb PDB_PATH [--binder_chain]
+usage: moppit-peptiderive --pdb PDB_PATH [--binder_chain]
 
 arguments:
   --pdb             The path to the binder-target protein complex structure

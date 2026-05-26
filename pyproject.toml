@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moppit"
+version = "0.1.0"
+description = "Motif-specific peptide binder prediction and generation with moPPIt."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Academic use only; see upstream repository/license terms." }
+authors = [
+  { name = "Chatterjee Lab" }
+]
+dependencies = [
+  "torch>=2.7",
+  "pytorch-lightning>=2.3",
+  "transformers>=4.41",
+  "datasets>=2.20",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "scikit-learn>=1.5",
+  "scipy>=1.13",
+  "biopython>=1.83"
+]
+
+[project.optional-dependencies]
+train = [
+  "wandb>=0.17"
+]
+peptiderive = []
+dev = [
+  "pytest>=8",
+  "ruff>=0.6"
+]
+
+[project.scripts]
+moppit-predict = "moppit.predict_motifs:main"
+moppit-generate = "moppit.generation:main_cli"
+pepmlm-generate = "moppit.pepmlm:main"
+moppit-peptiderive = "moppit.peptiderive:main_cli"
+
+[tool.setuptools]
+packages = ["moppit", "moppit.models", "models"]
+
+[tool.setuptools.package-dir]
+moppit = "src/moppit"
+"moppit.models" = "src/moppit/models"
+models = "models"

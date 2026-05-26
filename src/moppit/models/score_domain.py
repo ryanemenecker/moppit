@@ -1,0 +1,1 @@
+from models.score_domain import *
