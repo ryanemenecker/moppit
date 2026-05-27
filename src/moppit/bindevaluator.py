@@ -2,6 +2,7 @@ from argparse import ArgumentParser, SUPPRESS
 import json
 import os
 from pathlib import Path
+import warnings
 
 import pytorch_lightning as pl
 import torch
@@ -15,6 +16,16 @@ from .models import FFN, MultiHeadAttentionSequence, RepeatedModule3
 ESM_MODEL_NAME = "facebook/esm2_t33_650M_UR50D"
 DEFAULT_MAX_LENGTH = 40000
 DEFAULT_MODEL_ENV_VAR = "MOPPIT_BINDEVALUATOR_CKPT"
+DEFAULT_MODEL_DIR_ENV_VAR = "MOPPIT_MODEL_DIR"
+MODEL_DIR_ENV_VARS = (DEFAULT_MODEL_DIR_ENV_VAR, "MOPPIT_MODEL_WEIGHTS_DIR")
+HF_ROOT_ENV_VAR = "MOPPIT_HF_ROOT"
+FROZEN_ESM_COMPATIBILITY_KEYS = (
+    "esm_model.embeddings.position_embeddings.weight",
+)
+DEFAULT_MODEL_FILENAMES = (
+    "finetuned_BindEvaluator.ckpt",
+    "pretrained_BindEvaluator.ckpt",
+)
 PUBLISHED_BINDEVALUATOR_CONFIG = {
     "n_layers": 8,
     "d_model": 128,
@@ -38,11 +49,28 @@ CHECKPOINT_PRESETS = {
     "legacy": LEGACY_BINDEVALUATOR_CONFIG,
 }
 DEFAULT_MODEL_CANDIDATES = (
+    Path("~/model_weights/moppit/finetuned_BindEvaluator.ckpt"),
+    Path("~/model_weights/moppit/pretrained_BindEvaluator.ckpt"),
     Path("model_path/finetuned_BindEvaluator.ckpt"),
     Path("model_path/pretrained_BindEvaluator.ckpt"),
     Path("classifier_ckpt/finetuned_BindEvaluator.ckpt"),
     Path("moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt"),
 )
+DEFAULT_MODEL_DIR_CANDIDATES = (
+    Path("~/model_weights/moppit"),
+    Path("model_path"),
+    Path("classifier_ckpt"),
+    Path("moPPIt/classifier_ckpt"),
+)
+
+
+def drop_frozen_esm_compatibility_keys(state_dict, model_state_keys):
+    removed_keys = []
+    for key in FROZEN_ESM_COMPATIBILITY_KEYS:
+        if key in state_dict and key not in model_state_keys:
+            state_dict.pop(key)
+            removed_keys.append(key)
+    return removed_keys
 
 
 def parse_motif(motif: str, index_base: int = 0) -> list[int]:
@@ -112,6 +140,21 @@ class PeptideModel(pl.LightningModule):
         prot_enc = self.output_projection_prot(prot_enc)
 
         return prot_enc
+
+    def on_load_checkpoint(self, checkpoint):
+        state_dict = checkpoint.get("state_dict")
+        if not state_dict:
+            return
+
+        removed_keys = drop_frozen_esm_compatibility_keys(state_dict, set(self.state_dict()))
+        if removed_keys:
+            warnings.warn(
+                "Ignoring frozen ESM checkpoint key(s) that are not present in the installed "
+                f"transformers EsmModel: {', '.join(removed_keys)}. This preserves BindEvaluator "
+                "checkpoint loading across transformers versions without changing the moPPIt model head.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def get_probs(self, binder_input_ids, target_input_ids):
         target_input_ids = target_input_ids.repeat(binder_input_ids.shape[0], 1)
@@ -218,23 +261,106 @@ def resolve_device(device="auto"):
     return torch.device(device)
 
 
-def resolve_checkpoint_path(model_path=None):
+def _expand_path(path):
+    return Path(path).expanduser()
+
+
+def _iter_configured_model_directories(model_dir=None):
+    if model_dir:
+        yield "--model-dir", _expand_path(model_dir)
+
+    for env_var in MODEL_DIR_ENV_VARS:
+        env_model_dir = os.environ.get(env_var)
+        if env_model_dir:
+            yield env_var, _expand_path(env_model_dir)
+
+
+def _iter_default_model_directories():
+    hf_root = os.environ.get(HF_ROOT_ENV_VAR)
+    if hf_root:
+        yield f"{HF_ROOT_ENV_VAR}/classifier_ckpt", _expand_path(hf_root) / "classifier_ckpt"
+
+
+    for candidate in DEFAULT_MODEL_DIR_CANDIDATES:
+        yield "default", _expand_path(candidate)
+
+
+def _dedupe_directories(directories):
+    seen = set()
+    for source, directory in directories:
+        directory_key = str(directory)
+        if directory_key in seen:
+            continue
+        seen.add(directory_key)
+        yield source, directory
+
+
+def _find_checkpoint_in_directories(directories):
+    searched = []
+    ambiguous_directories = []
+    for source, directory in _dedupe_directories(directories):
+        known_candidates = [directory / filename for filename in DEFAULT_MODEL_FILENAMES]
+        for candidate in known_candidates:
+            searched.append(candidate)
+            if candidate.exists():
+                return str(candidate), searched, ambiguous_directories
+
+        if not directory.exists() or not directory.is_dir():
+            continue
+
+        fallback_candidates = sorted(
+            candidate for candidate in directory.glob("*.ckpt")
+            if candidate.name not in DEFAULT_MODEL_FILENAMES
+        )
+        if len(fallback_candidates) == 1:
+            return str(fallback_candidates[0]), searched, ambiguous_directories
+        if len(fallback_candidates) > 1:
+            ambiguous_directories.append((source, directory, fallback_candidates))
+
+    return None, searched, ambiguous_directories
+
+
+def _raise_checkpoint_discovery_error(searched, ambiguous_directories):
+    if ambiguous_directories:
+        details = "; ".join(
+            f"{directory} ({', '.join(candidate.name for candidate in candidates)})"
+            for source, directory, candidates in ambiguous_directories
+        )
+        raise FileNotFoundError(
+            "Found multiple BindEvaluator checkpoint candidates. Pass --model/-sm explicitly, "
+            "or rename the desired checkpoint to finetuned_BindEvaluator.ckpt or "
+            f"pretrained_BindEvaluator.ckpt. Ambiguous directories: {details}"
+        )
+
+    candidates = ", ".join(str(candidate) for candidate in searched)
+    model_dir_env_vars = "/".join(MODEL_DIR_ENV_VARS)
+    raise FileNotFoundError(
+        "No BindEvaluator checkpoint was provided or discovered. Use --model/-sm, set "
+        f"{DEFAULT_MODEL_ENV_VAR} to an exact checkpoint path, set {model_dir_env_vars} "
+        "or --model-dir to a directory such as ~/model_weights/moppit, or place a checkpoint at one of: "
+        f"{candidates}"
+    )
+
+
+def resolve_checkpoint_path(model_path=None, model_dir=None):
     if model_path:
-        return model_path
+        return str(_expand_path(model_path))
 
     env_model_path = os.environ.get(DEFAULT_MODEL_ENV_VAR)
     if env_model_path:
-        return env_model_path
+        return str(_expand_path(env_model_path))
 
-    for candidate in DEFAULT_MODEL_CANDIDATES:
-        if candidate.exists():
-            return str(candidate)
+    configured_directories = list(_dedupe_directories(_iter_configured_model_directories(model_dir)))
+    if configured_directories:
+        checkpoint_path, searched, ambiguous_directories = _find_checkpoint_in_directories(configured_directories)
+        if checkpoint_path:
+            return checkpoint_path
+        _raise_checkpoint_discovery_error(searched, ambiguous_directories)
 
-    candidates = ", ".join(str(candidate) for candidate in DEFAULT_MODEL_CANDIDATES)
-    raise FileNotFoundError(
-        "No BindEvaluator checkpoint was provided. Use --model/-sm, set "
-        f"{DEFAULT_MODEL_ENV_VAR}, or place a checkpoint at one of: {candidates}"
-    )
+    checkpoint_path, searched, ambiguous_directories = _find_checkpoint_in_directories(_iter_default_model_directories())
+    if checkpoint_path:
+        return checkpoint_path
+    _raise_checkpoint_discovery_error(searched, ambiguous_directories)
 
 
 def is_git_lfs_pointer(path):
@@ -247,7 +373,7 @@ def is_git_lfs_pointer(path):
 
 
 def validate_checkpoint_path(checkpoint_path):
-    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path = _expand_path(checkpoint_path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"BindEvaluator checkpoint does not exist: {checkpoint_path}")
     if is_git_lfs_pointer(checkpoint_path):
@@ -272,7 +398,9 @@ def resolve_model_config(args):
 
 def load_bindevaluator_checkpoint(args, device=None):
     device = device or resolve_device(getattr(args, "device", "auto"))
-    checkpoint_path = validate_checkpoint_path(resolve_checkpoint_path(getattr(args, "sm", None)))
+    checkpoint_path = validate_checkpoint_path(
+        resolve_checkpoint_path(getattr(args, "sm", None), getattr(args, "model_dir", None))
+    )
     config = resolve_model_config(args)
     model = PeptideModel.load_from_checkpoint(
         checkpoint_path,
@@ -351,7 +479,11 @@ def summarize_motif_scores(prediction, motifs, threshold=0.5):
 
 def add_checkpoint_arguments(parser):
     parser.add_argument("-sm", "--model", dest="sm", default=None,
-                        help="BindEvaluator checkpoint path. Defaults to MOPPIT_BINDEVALUATOR_CKPT or model_path/*.ckpt.")
+                        help="BindEvaluator checkpoint path. Overrides checkpoint directory discovery.")
+    parser.add_argument("--model-dir", default=None,
+                        help="Directory containing BindEvaluator checkpoints. Defaults to MOPPIT_MODEL_DIR, "
+                            "MOPPIT_MODEL_WEIGHTS_DIR, MOPPIT_HF_ROOT/classifier_ckpt, "
+                            "~/model_weights/moppit, and repo-local fallback paths.")
     parser.add_argument("--checkpoint-preset", choices=sorted(CHECKPOINT_PRESETS), default="published",
                         help="Architecture preset for loading checkpoints. Use 'published' for ChatterjeeLab/moPPIt weights.")
     parser.add_argument("-n_layers", "--n-layers", dest="n_layers", type=int, default=None,

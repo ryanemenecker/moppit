@@ -25,9 +25,9 @@ There are three kinds of model assets to be aware of:
 
 | Asset | Used by | How it is obtained | Recommended location |
 | --- | --- | --- | --- |
-| BindEvaluator checkpoint, usually `finetuned_BindEvaluator.ckpt` | `moppit-predict`, `moppit-generate`, motif/specificity scoring inside MOG-DFM | Download from the Hugging Face moPPIt repository or use your existing checkpoint | `model_path/finetuned_BindEvaluator.ckpt`, `moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt`, or `MOPPIT_BINDEVALUATOR_CKPT` |
+| BindEvaluator checkpoint, usually `finetuned_BindEvaluator.ckpt` | `moppit-predict`, `moppit-generate`, motif/specificity scoring inside MOG-DFM | Download from the Hugging Face moPPIt repository or use your existing checkpoint | Recommended: `~/model_weights/moppit/finetuned_BindEvaluator.ckpt` with `MOPPIT_MODEL_DIR=~/model_weights/moppit`; exact path override: `MOPPIT_BINDEVALUATOR_CKPT` |
 | Protein language models `facebook/esm2_t33_650M_UR50D` and `ChatterjeeLab/PepMLM-650M` | ESM embedding, prediction, PepMLM/GA binder design | Downloaded automatically by `transformers` on first use | Hugging Face cache, optionally controlled with `HF_HOME` |
-| MOG-DFM solver, classifier assets, and `PeptiVerse/` | `moppit-mog-dfm` multi-objective binder design | Hugging Face moPPIt Git LFS assets plus a local PeptiVerse checkout/release | `moPPIt/` at the repository root |
+| MOG-DFM solver, classifier assets, and `PeptiVerse/` | `moppit-mog-dfm` multi-objective binder design | Hugging Face moPPIt Git LFS assets plus a local PeptiVerse checkout/release | Recommended: `~/model_weights/moppit/moPPIt` with `MOPPIT_HF_ROOT=~/model_weights/moppit/moPPIt`; repo-local `moPPIt/` also works |
 
 The local package exposes the same user-facing functionality as the Hugging Face version when the Hugging Face weights and PeptiVerse assets are present, but those large assets are not bundled in this repository.
 
@@ -89,57 +89,79 @@ moppit-mog-dfm --help
 
 ## 0.2 Download and Place BindEvaluator Weights
 
-For binding-site prediction and the default PepMLM/GA binder designer, you need a BindEvaluator checkpoint. The fine-tuned peptide-protein checkpoint is the usual choice:
+For binding-site prediction and the default PepMLM/GA binder designer, you need a BindEvaluator checkpoint. The fine-tuned peptide-protein checkpoint is the usual choice. You do not need to keep weights in the repository; the recommended layout is an external model directory:
 
 ```bash
-mkdir -p model_path
+mkdir -p ~/model_weights/moppit
 # Put your checkpoint here:
-# model_path/finetuned_BindEvaluator.ckpt
+# ~/model_weights/moppit/finetuned_BindEvaluator.ckpt
+
+# Add this to your shell profile or job script.
+export MOPPIT_MODEL_DIR=~/model_weights/moppit
 ```
 
 moPPIt searches for checkpoints in this order:
 
 1. The explicit `--model` / `-sm` argument.
 2. The `MOPPIT_BINDEVALUATOR_CKPT` environment variable.
-3. `model_path/finetuned_BindEvaluator.ckpt`.
-4. `model_path/pretrained_BindEvaluator.ckpt`.
-5. `classifier_ckpt/finetuned_BindEvaluator.ckpt`.
-6. `moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt`.
+3. The explicit `--model-dir` argument.
+4. The `MOPPIT_MODEL_DIR` or `MOPPIT_MODEL_WEIGHTS_DIR` environment variable.
+5. `MOPPIT_HF_ROOT/classifier_ckpt/`, if `MOPPIT_HF_ROOT` is set.
+6. `~/model_weights/moppit/finetuned_BindEvaluator.ckpt`.
+7. `~/model_weights/moppit/pretrained_BindEvaluator.ckpt`.
+8. Repo-local fallbacks: `model_path/*.ckpt`, `classifier_ckpt/finetuned_BindEvaluator.ckpt`, and `moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt`.
 
-Set the environment variable if you keep weights outside the repository:
+When searching a directory, moPPIt first looks for `finetuned_BindEvaluator.ckpt` and then `pretrained_BindEvaluator.ckpt`. If neither exists and the directory contains exactly one `.ckpt` file, that file is used. If there are multiple `.ckpt` files with non-standard names, pass `--model /path/to/file.ckpt` or rename the desired file to one of the standard names.
+
+Use an exact file path if you want complete control:
 
 ```bash
 export MOPPIT_BINDEVALUATOR_CKPT=/absolute/path/to/finetuned_BindEvaluator.ckpt
 ```
 
-To download the Hugging Face moPPIt assets into the repository root, use Git LFS:
+Or use `--model-dir` for a one-off command without setting an environment variable:
 
 ```bash
-git lfs install
-git clone https://huggingface.co/ChatterjeeLab/moPPIt moPPIt
-cd moPPIt
-git lfs pull
-cd ..
+moppit-predict \
+  --model-dir ~/model_weights/moppit \
+  --target TARGET_PROTEIN_SEQUENCE \
+  --binder BINDER_SEQUENCE
 ```
 
-You can either leave the fine-tuned checkpoint at `moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt` or copy it into the local default path:
+To download the Hugging Face moPPIt assets outside the repository, use Git LFS:
 
 ```bash
-mkdir -p model_path
-cp moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt model_path/
+mkdir -p ~/model_weights/moppit
+git lfs install
+git clone https://huggingface.co/ChatterjeeLab/moPPIt ~/model_weights/moppit/moPPIt
+cd ~/model_weights/moppit/moPPIt
+git lfs pull
+cd ..
+
+# Let moPPIt commands discover the external HF clone and its BindEvaluator checkpoint.
+export MOPPIT_HF_ROOT=~/model_weights/moppit/moPPIt
+```
+
+You can either let `MOPPIT_HF_ROOT` point at the external clone or copy/symlink the fine-tuned checkpoint into your model directory:
+
+```bash
+ln -sf ~/model_weights/moppit/moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt \
+  ~/model_weights/moppit/finetuned_BindEvaluator.ckpt
 ```
 
 Validate that the checkpoint is a real weight file, not a Git LFS pointer:
 
 ```bash
 python - <<'PY'
-from moppit.bindevaluator import validate_checkpoint_path
+from moppit.bindevaluator import resolve_checkpoint_path, validate_checkpoint_path
 
-print(validate_checkpoint_path("model_path/finetuned_BindEvaluator.ckpt"))
+print(validate_checkpoint_path(resolve_checkpoint_path()))
 PY
 ```
 
 If a checkpoint is still a Git LFS pointer, `moppit-predict` and `moppit-generate` fail early with a clear message instead of a PyTorch deserialization traceback.
+
+Some current `transformers` versions print an ESM load report about `lm_head.*` keys being unexpected and `pooler.*` keys being missing when `facebook/esm2_t33_650M_UR50D` is loaded as an encoder. That report is expected for this workflow. Older BindEvaluator checkpoints may also contain the frozen ESM key `esm_model.embeddings.position_embeddings.weight`; moPPIt ignores that obsolete key only when the installed `EsmModel` no longer has it, while keeping strict loading for the BindEvaluator model head.
 
 ## 0.3 Pre-Download Language Models on a Cluster
 
@@ -168,7 +190,7 @@ Use `moppit-mog-dfm` for the newer Hugging Face Multi-Objective-Guided Discrete 
 Expected layout:
 
 ```text
-moppit/
+~/model_weights/moppit/
   moPPIt/
     moppit.py
     ckpt/peptide/cnn_epoch200_lr0.0001_embed512_hidden256_loss3.1051.ckpt
@@ -193,22 +215,24 @@ Set it up with:
 ```bash
 python -m pip install -e ".[mogdfm]"
 
+mkdir -p ~/model_weights/moppit
 git lfs install
-git clone https://huggingface.co/ChatterjeeLab/moPPIt moPPIt
-cd moPPIt
+git clone https://huggingface.co/ChatterjeeLab/moPPIt ~/model_weights/moppit/moPPIt
+cd ~/model_weights/moppit/moPPIt
 git lfs pull
 cd ..
 
+export MOPPIT_HF_ROOT=~/model_weights/moppit/moPPIt
+
 # Place or clone PeptiVerse here so these files exist:
-# moPPIt/PeptiVerse/inference.py
-# moPPIt/PeptiVerse/best_models.txt
+# ~/model_weights/moppit/moPPIt/PeptiVerse/inference.py
+# ~/model_weights/moppit/moPPIt/PeptiVerse/best_models.txt
 ```
 
 Validate the MOG-DFM setup without generating peptides:
 
 ```bash
 moppit-mog-dfm --dry-run \
-  --hf-root moPPIt \
   --output_file samples.csv \
   --length 10 \
   --objectives Hemolysis Motif Specificity \
@@ -225,11 +249,12 @@ export MOPPIT_HF_ROOT=/path/to/moPPIt
 
 ## 0.5 First Commands After Setup
 
+These examples assume you set `MOPPIT_MODEL_DIR=~/model_weights/moppit` and, for MOG-DFM, `MOPPIT_HF_ROOT=~/model_weights/moppit/moPPIt`. Add `--model-dir ~/model_weights/moppit` or `--model /absolute/path/to/file.ckpt` to any prediction or GA generation command if you prefer not to use environment variables.
+
 Predict binding residues for a known target/binder pair:
 
 ```bash
 moppit-predict \
-  --model model_path/finetuned_BindEvaluator.ckpt \
   --target TARGET_PROTEIN_SEQUENCE \
   --binder BINDER_SEQUENCE \
   --motifs 18,23,59-61 \
@@ -240,7 +265,6 @@ Design motif-specific binders with the default PepMLM plus genetic-algorithm wor
 
 ```bash
 moppit-generate \
-  --model model_path/finetuned_BindEvaluator.ckpt \
   --protein-seq TARGET_PROTEIN_SEQUENCE \
   --peptide-length 11 \
   --motif 18,23,59-61 \
@@ -253,7 +277,6 @@ Design binders with the Hugging Face MOG-DFM multi-objective workflow:
 
 ```bash
 moppit-mog-dfm \
-  --hf-root moPPIt \
   --output_file samples.csv \
   --length 10 \
   --n_batches 600 \
@@ -300,13 +323,15 @@ To fine-tune the pre-trained BindEvaluator, run `scripts/finetune.sh`
 
 To test the performance of BindEvaluator, run `scripts/test.sh`
 
+`scripts/finetune.sh` and `scripts/test.sh` default to checkpoints under `${MOPPIT_MODEL_DIR:-$HOME/model_weights/moppit}`. Override the exact pretrained checkpoint for fine-tuning with `MOPPIT_PRETRAINED_BINDEVALUATOR_CKPT`, or override the exact fine-tuned checkpoint for testing/prediction with `MOPPIT_BINDEVALUATOR_CKPT`.
+
 Ensure you adjust the hyper-parameters according to your specific requirements.
 
 # 3. Binding site prediction
 
-Protein-protein interaction binding sites can be predicted using the pre-trained BindEvaluator (`model_path/pretrained_BindEvaluator.ckpt`)
+Protein-protein interaction binding sites can be predicted using the pre-trained BindEvaluator, usually named `pretrained_BindEvaluator.ckpt` in your model directory.
 
-Peptide-protein interaction binding sites can be predicted using the fine-tuned BindEvaluator (`model_path/finetuned_BindEvaluator.ckpt`)
+Peptide-protein interaction binding sites can be predicted using the fine-tuned BindEvaluator, usually named `finetuned_BindEvaluator.ckpt` in your model directory.
 
 We provide an example script to use BindEvaluator to predict binding sites (`scripts/predict.sh`). After installation, use the `moppit-predict` console command. The legacy `python predict_motifs.py` wrapper is still available from the repository checkout.
 
@@ -315,7 +340,7 @@ NOTE: amino acid indices start from 0 on a protein sequence
 The published ChatterjeeLab/moPPIt BindEvaluator checkpoints use the default `published` architecture preset (`n_layers=8`, `d_model=128`, `d_hidden=128`, `n_head=8`, `d_inner=64`), so these values do not need to be provided for normal prediction. Use `--checkpoint-preset legacy` or the explicit architecture override flags only for non-published checkpoints.
 
 ``` txt
-usage: moppit-predict [--model MODEL_PATH] --target TARGET --binder BINDER
+usage: moppit-predict [--model MODEL_PATH] [--model-dir MODEL_DIR] --target TARGET --binder BINDER
                       [--threshold THRESHOLD] [--output OUTPUT.json]
                       [--device auto|cpu|cuda|cuda:0]
                       [--checkpoint-preset published|legacy]
@@ -323,7 +348,8 @@ usage: moppit-predict [--model MODEL_PATH] --target TARGET --binder BINDER
                       [architecture overrides]
 
 arguments:
-  --model, -sm         The path to the BindEvaluator model weights. If omitted, moPPIt checks MOPPIT_BINDEVALUATOR_CKPT, model_path/*.ckpt, classifier_ckpt/finetuned_BindEvaluator.ckpt, and moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt.
+  --model, -sm         Exact path to the BindEvaluator model weights. Overrides checkpoint directory discovery.
+  --model-dir          Directory containing BindEvaluator checkpoints. If omitted, moPPIt checks MOPPIT_MODEL_DIR, MOPPIT_MODEL_WEIGHTS_DIR, ~/model_weights/moppit, MOPPIT_HF_ROOT/classifier_ckpt, and repo-local fallback paths.
   --target, -target    Target protein sequence
   --binder, -binder    Binder sequence
   --ground-truth, -gt  Ground truth binding motifs if known, for example 18,23,59-61. Brackets are optional.
@@ -341,7 +367,6 @@ Example:
 
 ```bash
 moppit-predict \
-  --model model_path/finetuned_BindEvaluator.ckpt \
   --target IVEGSDAEIGMSPWQVMLFRKSPQELLCGASLISDRWVLTAAHCLLYPPWDKNFTENDLLVRIGKHSRTRYERNIEKISMLEKIYIHPRYNWRENLDRDIALMKLKKPVAFSDYIHPVCLPDRETAASLLQAGYKGRVTGWGNLKETGQPSVLQVVNLPIVERPVCKDSTRIRITDNMFCAGYKPDEGKRGDACEGDSGGPFVMKSPFNNRWYQMGIVSWGEGCDRDGKYGFYTHVFRLKKWIQKVIDQFGE \
   --binder GYEEIPEEYLQ \
   --motifs 18,23,59,67,68,69,70,76,77 \
@@ -352,7 +377,7 @@ moppit-predict \
 
 We provide an example script to use moPPIt for generating motif-specific binders based on a target sequence (`scripts/generation.sh`). After installation, use the `moppit-generate` console command. The legacy `python moppit.py` wrapper is still available from the repository checkout.
 ``` txt
-usage: moppit-generate [--model MODEL_PATH] --protein-seq PROTEIN --peptide-length LENGTH --motif MOTIF
+usage: moppit-generate [--model MODEL_PATH] [--model-dir MODEL_DIR] --protein-seq PROTEIN --peptide-length LENGTH --motif MOTIF
                        [--top-k TOP_K] [--num-binders NUM_BINDERS]
                        [--num-display NUM_DISPLAY] [--max-iterations MAX_ITERATIONS]
                        [--threshold THRESHOLD] [--output OUTPUT.csv]
@@ -361,7 +386,8 @@ usage: moppit-generate [--model MODEL_PATH] --protein-seq PROTEIN --peptide-leng
                        [architecture overrides]
 
 arguments:
-  --model, -sm         The path to the BindEvaluator model weights. If omitted, moPPIt checks MOPPIT_BINDEVALUATOR_CKPT, model_path/*.ckpt, classifier_ckpt/finetuned_BindEvaluator.ckpt, and moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt.
+  --model, -sm         Exact path to the BindEvaluator model weights. Overrides checkpoint directory discovery.
+  --model-dir          Directory containing BindEvaluator checkpoints. If omitted, moPPIt checks MOPPIT_MODEL_DIR, MOPPIT_MODEL_WEIGHTS_DIR, ~/model_weights/moppit, MOPPIT_HF_ROOT/classifier_ckpt, and repo-local fallback paths.
   --protein-seq        Target protein sequence. The old --protein_seq spelling is also accepted.
   --peptide-length     The length for generated binders. The old --peptide_length spelling is also accepted.
   --motif              Binding motifs with 0-based indices, for example 18,23,59-61. Brackets are optional.
@@ -380,7 +406,6 @@ Example:
 
 ```bash
 moppit-generate \
-  --model model_path/finetuned_BindEvaluator.ckpt \
   --protein-seq IVEGSDAEIGMSPWQVMLFRKSPQELLCGASLISDRWVLTAAHCLLYPPWDKNFTENDLLVRIGKHSRTRYERNIEKISMLEKIYIHPRYNWRENLDRDIALMKLKKPVAFSDYIHPVCLPDRETAASLLQAGYKGRVTGWGNLKETGQPSVLQVVNLPIVERPVCKDSTRIRITDNMFCAGYKPDEGKRGDACEGDSGGPFVMKSPFNNRWYQMGIVSWGEGCDRDGKYGFYTHVFRLKKWIQKVIDQFGE \
   --peptide-length 11 \
   --motif 18,23,59,67,68,69,70,76,77 \

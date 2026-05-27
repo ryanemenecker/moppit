@@ -1,7 +1,8 @@
 export CUDA_VISIBLE_DEVICES=0
+HF_ROOT="${MOPPIT_HF_ROOT:-$HOME/model_weights/moppit/moPPIt}"
 
 moppit-mog-dfm \
---hf-root moPPIt \
+--hf-root "$HF_ROOT" \
 --output_file './samples.csv' \
 --length 10 \
 --n_batches 600 \
