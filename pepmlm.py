@@ -8,20 +8,24 @@ if _SRC_ROOT.exists() and str(_SRC_ROOT) not in sys.path:
 
 from moppit.pepmlm import (  # noqa: E402
     PEPMLM_MODEL_NAME,
+    build_parser,
     compute_pseudo_perplexity,
     generate_peptide,
     generate_peptide_for_single_sequence,
     get_default_pepmlm,
     main,
+    resolve_device,
 )
 
 __all__ = [
     "PEPMLM_MODEL_NAME",
+    "build_parser",
     "compute_pseudo_perplexity",
     "generate_peptide",
     "generate_peptide_for_single_sequence",
     "get_default_pepmlm",
     "main",
+    "resolve_device",
 ]
 
 

@@ -13,17 +13,27 @@ if __name__ == "moppit" and _PACKAGE_ROOT.exists():
     __path__ = [str(_PACKAGE_ROOT)]
 
 from moppit.bindevaluator import PeptideModel, calculate_score, parse_motif  # noqa: E402
-from moppit.generation import Binder, cal_score, generate_random_seq, main, main_cli  # noqa: E402
+from moppit.generation import (  # noqa: E402
+    Binder,
+    build_parser,
+    cal_score,
+    generate_random_seq,
+    main,
+    main_cli,
+    write_generation_output,
+)
 
 __all__ = [
     "Binder",
     "PeptideModel",
+    "build_parser",
     "cal_score",
     "calculate_score",
     "generate_random_seq",
     "main",
     "main_cli",
     "parse_motif",
+    "write_generation_output",
 ]
 
 

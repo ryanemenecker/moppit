@@ -102,12 +102,20 @@ def generate_peptide(input_seqs, peptide_length=15, top_k=3, num_binders=4, mode
     raise TypeError("input_seqs must be a protein sequence string or a list of sequence strings")
 
 
+def resolve_device(device="auto"):
+    if device == "auto":
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    return torch.device(device)
+
+
 def build_parser():
     parser = ArgumentParser()
-    parser.add_argument("-s", type=str, required=True)
-    parser.add_argument("--peptide_length", type=int, default=13)
-    parser.add_argument("--top_k", type=int, default=2)
-    parser.add_argument("--num_binders", type=int, default=50)
+    parser.add_argument("-s", "--sequence", dest="sequence", type=str, required=True)
+    parser.add_argument("--peptide_length", "--peptide-length", dest="peptide_length", type=int, default=13)
+    parser.add_argument("--top_k", "--top-k", dest="top_k", type=int, default=2)
+    parser.add_argument("--num_binders", "--num-binders", dest="num_binders", type=int, default=50)
+    parser.add_argument("--device", default="auto", help="Torch device to use, such as auto, cpu, cuda, or cuda:0.")
+    parser.add_argument("--output", type=str, default=None, help="Optional CSV file for generated binders.")
     return parser
 
 
@@ -115,11 +123,15 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    peptide_df = generate_peptide(args.s, args.peptide_length, args.top_k, args.num_binders)
+    device = resolve_device(args.device)
+    model, tokenizer = get_default_pepmlm(device)
+    peptide_df = generate_peptide(args.sequence, args.peptide_length, args.top_k, args.num_binders,
+                                  model=model, tokenizer=tokenizer)
     peptide_df = peptide_df.drop_duplicates(subset="Binder")
     peptide_df = peptide_df.sort_values(by="Pseudo Perplexity")
+    if args.output is not None:
+        peptide_df.to_csv(args.output, index=False)
     print(peptide_df)
-    return peptide_df
 
 
 if __name__ == "__main__":

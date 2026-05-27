@@ -1,10 +1,19 @@
-from argparse import ArgumentParser
+from argparse import ArgumentParser, SUPPRESS
+import csv
+from pathlib import Path
 import random
 
 import torch
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-from .bindevaluator import calculate_score, load_bindevaluator_checkpoint, parse_motif
+from .bindevaluator import (
+    ESM_MODEL_NAME,
+    add_checkpoint_arguments,
+    calculate_score,
+    load_bindevaluator_checkpoint,
+    parse_motif,
+    resolve_device,
+)
 from .pepmlm import PEPMLM_MODEL_NAME, compute_pseudo_perplexity, generate_peptide
 
 
@@ -15,31 +24,33 @@ def generate_random_seq(length):
     return "".join(random.choice(AA) for residue_index in range(length))
 
 
-def cal_score(binder_seq, protein_seq, motif, model, args):
-    prediction, threshold = calculate_score(protein_seq, binder_seq, model, args)
+def cal_score(binder_seq, protein_seq, motif, model, args, tokenizer=None):
+    prediction, threshold = calculate_score(protein_seq, binder_seq, model, args, tokenizer=tokenizer)
     score = 0
     for position in motif:
-        if prediction[position] < 0.5:
+        if prediction[position] < args.threshold:
             score += 1
 
     for position in range(len(prediction)):
-        if position not in motif and prediction[position] >= 0.5:
+        if position not in motif and prediction[position] >= args.threshold:
             score += 0.5
 
     return score
 
 
 class Binder(object):
-    def __init__(self, binder_seq, model, pepmlm, tokenizer, args):
+    def __init__(self, binder_seq, model, pepmlm, pepmlm_tokenizer, bindevaluator_tokenizer, args):
         self.binder_seq = binder_seq
         self.protein_seq = args.protein_seq
         self.motif = parse_motif(args.motif.strip("[]"))
         self.model = model
         self.args = args
         self.pepmlm = pepmlm
-        self.tokenizer = tokenizer
-        self.score = cal_score(binder_seq, self.protein_seq, self.motif, self.model, self.args)
-        self.ppl = compute_pseudo_perplexity(self.pepmlm, self.tokenizer, self.protein_seq, self.binder_seq)
+        self.pepmlm_tokenizer = pepmlm_tokenizer
+        self.bindevaluator_tokenizer = bindevaluator_tokenizer
+        self.score = cal_score(binder_seq, self.protein_seq, self.motif, self.model, self.args,
+                               tokenizer=self.bindevaluator_tokenizer)
+        self.ppl = compute_pseudo_perplexity(self.pepmlm, self.pepmlm_tokenizer, self.protein_seq, self.binder_seq)
 
     def mutated_aa(self):
         return random.choice(AA)
@@ -65,21 +76,22 @@ class Binder(object):
             else:
                 child += self.mutated_aa()
 
-        return Binder(child, self.model, self.pepmlm, self.tokenizer, self.args)
+        return Binder(child, self.model, self.pepmlm, self.pepmlm_tokenizer, self.bindevaluator_tokenizer, self.args)
 
 
 def main(args):
-    print(parse_motif(args.motif.strip("[]")))
+    print(parse_motif(args.motif))
     random.seed(args.seed)
     binders = []
     generation = 0
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(device)
+    device = resolve_device(args.device)
+    print(f"Device: {device}")
     model = load_bindevaluator_checkpoint(args, device=device)
 
     tokenizer = AutoTokenizer.from_pretrained(PEPMLM_MODEL_NAME)
     pepmlm = AutoModelForMaskedLM.from_pretrained(PEPMLM_MODEL_NAME).to(device)
+    bindevaluator_tokenizer = AutoTokenizer.from_pretrained(ESM_MODEL_NAME)
 
     temp_binders = []
     count = 2
@@ -98,7 +110,7 @@ def main(args):
     print(f"Pool Size = {len(temp_binders)}")
 
     for binder_seq in temp_binders:
-        binders.append(Binder(binder_seq, model, pepmlm, tokenizer, args))
+        binders.append(Binder(binder_seq, model, pepmlm, tokenizer, bindevaluator_tokenizer, args))
 
     binders = sorted(binders, key=lambda binder: (binder.score, binder.ppl))
     for display_index in range(min(args.num_display, len(binders))):
@@ -109,7 +121,7 @@ def main(args):
 
     no_improvement_generations = 0
     max_tolerance = args.max_iterations
-    threshold = int(0.1 * len(parse_motif(args.motif.strip("[]"))))
+    threshold = int(0.1 * len(parse_motif(args.motif)))
 
     print(f"Threshold: {threshold}")
 
@@ -132,7 +144,7 @@ def main(args):
         for binder_index in range(1, len(new_binders)):
             if new_binders[binder_index].binder_seq == new_binders[binder_index - 1].binder_seq:
                 new_seq = new_binders[binder_index].mutate_seq(new_binders[binder_index].binder_seq)
-                new_binders[binder_index] = Binder(new_seq, model, pepmlm, tokenizer, args)
+                new_binders[binder_index] = Binder(new_seq, model, pepmlm, tokenizer, bindevaluator_tokenizer, args)
 
         new_binders = sorted(new_binders, key=lambda binder: (binder.score, binder.ppl))
 
@@ -154,32 +166,54 @@ def main(args):
 
     print(f"moPPIt Stopping\tBinder: {binders[0].binder_seq}\tScore: {binders[0].score}\tPPL: {binders[0].ppl}")
 
+    if args.output is not None:
+        write_generation_output(args.output, binders, args.num_display)
+
+    return binders
+
+
+def write_generation_output(output_path, binders, limit=None):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    selected_binders = binders[:limit] if limit is not None else binders
+
+    with output_path.open("w", newline="") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=["binder", "score", "pseudo_perplexity"])
+        writer.writeheader()
+        for binder in selected_binders:
+            writer.writerow({
+                "binder": binder.binder_seq,
+                "score": binder.score,
+                "pseudo_perplexity": binder.ppl,
+            })
+
 
 def build_parser():
     parser = ArgumentParser()
-    parser.add_argument("--protein_seq", type=str, required=True)
-    parser.add_argument("--peptide_length", type=int, required=True)
+    add_checkpoint_arguments(parser)
+    parser.add_argument("--protein_seq", "--protein-seq", dest="protein_seq", type=str, required=True)
+    parser.add_argument("--peptide_length", "--peptide-length", dest="peptide_length", type=int, required=True)
     parser.add_argument("--motif", type=str, required=True)
-    parser.add_argument("--top_k", type=int, default=3)
-    parser.add_argument("--num_binders", type=int, default=10)
+    parser.add_argument("--top_k", "--top-k", dest="top_k", type=int, default=3)
+    parser.add_argument("--num_binders", "--num-binders", dest="num_binders", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("-sm", required=True, help="File containing initial params", type=str)
-    parser.add_argument("-batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("-lr", type=float, default=1e-3)
-    parser.add_argument("-n_layers", type=int, default=6, help="Number of layers")
-    parser.add_argument("-d_model", type=int, default=64, help="Dimension of model")
-    parser.add_argument("-d_hidden", type=int, default=128, help="Dimension of CNN block")
-    parser.add_argument("-n_head", type=int, default=6, help="Number of heads")
-    parser.add_argument("-d_inner", type=int, default=64)
-    parser.add_argument("--num_display", type=int, default=1)
-    parser.add_argument("-max_iterations", type=int, default=20, help="Maximum no improvement iterations")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Binding-site probability threshold for scoring.")
+    parser.add_argument("--num_display", "--num-display", dest="num_display", type=int, default=1)
+    parser.add_argument("-max_iterations", "--max_iterations", "--max-iterations", dest="max_iterations",
+                        type=int, default=20, help="Maximum no-improvement iterations")
+    parser.add_argument("--output", type=str, default=None, help="Optional CSV file for the final displayed binders.")
+    parser.add_argument("-batch_size", type=int, default=None, help=SUPPRESS)
+    parser.add_argument("-lr", type=float, default=None, help=SUPPRESS)
     return parser
 
 
 def main_cli(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    main(args)
+    try:
+        main(args)
+    except (FileNotFoundError, ValueError) as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 from .bindevaluator import (
+    CHECKPOINT_PRESETS,
     PeptideModel,
     build_parser,
     calculate_score,
@@ -7,9 +8,14 @@ from .bindevaluator import (
     main,
     parse_motif,
     predict_binding_sites,
+    resolve_checkpoint_path,
+    resolve_model_config,
+    summarize_motif_scores,
+    write_prediction_output,
 )
 
 __all__ = [
+    "CHECKPOINT_PRESETS",
     "PeptideModel",
     "build_parser",
     "calculate_score",
@@ -18,6 +24,10 @@ __all__ = [
     "main",
     "parse_motif",
     "predict_binding_sites",
+    "resolve_checkpoint_path",
+    "resolve_model_config",
+    "summarize_motif_scores",
+    "write_prediction_output",
 ]
 
 

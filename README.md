@@ -11,33 +11,60 @@ Motif-specific targeting of protein-protein interactions (PPIs) is crucial for d
 
 **Colab Notebook for Binding Site Prediction and Motif-Specific Binder Generation**: [Link](https://colab.research.google.com/drive/1SL3H_vI1y6qccce3vLOo0W2EpxIF4Xik?usp=sharing)
 
+**Colab Notebook for Hugging Face MOG-DFM Generation**: [Link](https://colab.research.google.com/drive/16n8PIwKwAiG-oDLm171BWvv-lQH0dHMg?usp=sharing)
+
 **Colab Notebook for PeptiDerive**: [Link](https://colab.research.google.com/drive/1aCODZ-WRwhxr-u8nEB6ZrdrhIOTz7-UF?usp=sharing)
 
 ---
 
-# 0. Installation
+# 0. Complete Local Setup
 
-moPPIt is now installable as a Python package. The BindEvaluator architecture names used by the checkpoints are preserved (`esm_model`, `repeated_module`, final attention/FFN layers, and output projection), so existing `.ckpt` weights can still be loaded for prediction as long as the model hyperparameters match the checkpoint.
+moPPIt is installable as a Python package. The BindEvaluator architecture names used by the checkpoints are preserved (`esm_model`, `repeated_module`, final attention/FFN layers, and output projection), so existing `.ckpt` weights can still be loaded for prediction and binder design as long as the model hyperparameters match the checkpoint. The published ChatterjeeLab/moPPIt checkpoints use the default `published` preset, so you should not need to pass architecture flags such as `--n-layers` for normal use.
 
-For Blackwell / CUDA 13+ machines, install a PyTorch build that matches the remote driver and CUDA runtime before installing moPPIt. This repository does not compile custom CUDA extensions; GPU compatibility comes from the installed PyTorch wheel or container.
+There are three kinds of model assets to be aware of:
+
+| Asset | Used by | How it is obtained | Recommended location |
+| --- | --- | --- | --- |
+| BindEvaluator checkpoint, usually `finetuned_BindEvaluator.ckpt` | `moppit-predict`, `moppit-generate`, motif/specificity scoring inside MOG-DFM | Download from the Hugging Face moPPIt repository or use your existing checkpoint | `model_path/finetuned_BindEvaluator.ckpt`, `moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt`, or `MOPPIT_BINDEVALUATOR_CKPT` |
+| Protein language models `facebook/esm2_t33_650M_UR50D` and `ChatterjeeLab/PepMLM-650M` | ESM embedding, prediction, PepMLM/GA binder design | Downloaded automatically by `transformers` on first use | Hugging Face cache, optionally controlled with `HF_HOME` |
+| MOG-DFM solver, classifier assets, and `PeptiVerse/` | `moppit-mog-dfm` multi-objective binder design | Hugging Face moPPIt Git LFS assets plus a local PeptiVerse checkout/release | `moPPIt/` at the repository root |
+
+The local package exposes the same user-facing functionality as the Hugging Face version when the Hugging Face weights and PeptiVerse assets are present, but those large assets are not bundled in this repository.
+
+## 0.1 Create the Environment
+
+For Blackwell / CUDA 13+ machines, install a PyTorch build that matches the remote driver and CUDA runtime before installing moPPIt. This repository does not compile custom CUDA extensions; GPU compatibility comes from the installed PyTorch wheel or container. On remote machines, the most reliable path is usually a current NVIDIA/PyTorch container or the command from the official PyTorch install selector for your CUDA runtime.
 
 ```bash
 conda env create -f environment.yml
 conda activate moppit
 python -m pip install --upgrade pip
 
-# Install the CUDA 13.x PyTorch command published for your PyTorch release.
-# If your remote image already provides CUDA 13+ PyTorch, skip this line.
+# Install the PyTorch wheel or container-compatible build for your CUDA runtime.
+# Use the official PyTorch selector for the exact CUDA 13.x command available for your release.
+# If your remote image already provides a compatible torch build, skip this line.
 python -m pip install torch torchvision torchaudio --index-url <PYTORCH_CUDA_13_WHEEL_INDEX>
 
-# Prediction and generation install.
+# Install normal prediction, PepMLM, and GA binder design commands.
 python -m pip install -e .
-
-# Or include training utilities such as wandb.
-python -m pip install -e ".[train]"
 ```
 
-Verify the GPU build before running checkpoint prediction:
+Install optional extras for the workflows you plan to run:
+
+```bash
+# Training and fine-tuning utilities.
+python -m pip install -e ".[train]"
+
+# Hugging Face MOG-DFM launcher dependencies.
+python -m pip install -e ".[mogdfm]"
+
+# Development tools.
+python -m pip install -e ".[dev]"
+```
+
+`moppit-peptiderive` requires PyRosetta, which is not installed by pip from this package. Install PyRosetta separately under its own license before using PeptiDerive.
+
+Verify the GPU build before running checkpoint prediction or generation:
 
 ```bash
 python - <<'PY'
@@ -47,9 +74,203 @@ print("torch", torch.__version__)
 print("cuda", torch.version.cuda)
 print("available", torch.cuda.is_available())
 if torch.cuda.is_available():
-  print("device", torch.cuda.get_device_name(0))
+    print("device", torch.cuda.get_device_name(0))
 PY
 ```
+
+Verify that the console commands are installed:
+
+```bash
+moppit-predict --help
+moppit-generate --help
+pepmlm-generate --help
+moppit-mog-dfm --help
+```
+
+## 0.2 Download and Place BindEvaluator Weights
+
+For binding-site prediction and the default PepMLM/GA binder designer, you need a BindEvaluator checkpoint. The fine-tuned peptide-protein checkpoint is the usual choice:
+
+```bash
+mkdir -p model_path
+# Put your checkpoint here:
+# model_path/finetuned_BindEvaluator.ckpt
+```
+
+moPPIt searches for checkpoints in this order:
+
+1. The explicit `--model` / `-sm` argument.
+2. The `MOPPIT_BINDEVALUATOR_CKPT` environment variable.
+3. `model_path/finetuned_BindEvaluator.ckpt`.
+4. `model_path/pretrained_BindEvaluator.ckpt`.
+5. `classifier_ckpt/finetuned_BindEvaluator.ckpt`.
+6. `moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt`.
+
+Set the environment variable if you keep weights outside the repository:
+
+```bash
+export MOPPIT_BINDEVALUATOR_CKPT=/absolute/path/to/finetuned_BindEvaluator.ckpt
+```
+
+To download the Hugging Face moPPIt assets into the repository root, use Git LFS:
+
+```bash
+git lfs install
+git clone https://huggingface.co/ChatterjeeLab/moPPIt moPPIt
+cd moPPIt
+git lfs pull
+cd ..
+```
+
+You can either leave the fine-tuned checkpoint at `moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt` or copy it into the local default path:
+
+```bash
+mkdir -p model_path
+cp moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt model_path/
+```
+
+Validate that the checkpoint is a real weight file, not a Git LFS pointer:
+
+```bash
+python - <<'PY'
+from moppit.bindevaluator import validate_checkpoint_path
+
+print(validate_checkpoint_path("model_path/finetuned_BindEvaluator.ckpt"))
+PY
+```
+
+If a checkpoint is still a Git LFS pointer, `moppit-predict` and `moppit-generate` fail early with a clear message instead of a PyTorch deserialization traceback.
+
+## 0.3 Pre-Download Language Models on a Cluster
+
+`transformers` downloads ESM2 and PepMLM automatically on first use. On clusters or offline jobs, it is better to stage them in advance. Set `HF_HOME` to a persistent cache if your compute node home directory is small:
+
+```bash
+export HF_HOME=/path/to/persistent/huggingface-cache
+
+python - <<'PY'
+from transformers import AutoModelForMaskedLM, AutoTokenizer, EsmModel
+
+AutoTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
+EsmModel.from_pretrained("facebook/esm2_t33_650M_UR50D")
+AutoTokenizer.from_pretrained("ChatterjeeLab/PepMLM-650M")
+AutoModelForMaskedLM.from_pretrained("ChatterjeeLab/PepMLM-650M")
+print("language models cached")
+PY
+```
+
+These language models are separate from the BindEvaluator `.ckpt` weights. You still need `finetuned_BindEvaluator.ckpt` for prediction and BindEvaluator-guided design.
+
+## 0.4 Optional MOG-DFM / Hugging Face Feature-Parity Assets
+
+Use `moppit-mog-dfm` for the newer Hugging Face Multi-Objective-Guided Discrete Flow Matching workflow. The checked-in Hugging Face script implements hemolysis, non-fouling, solubility, permeability, half-life, affinity, motif, and specificity objectives, and the launcher passes through upstream flags such as `--offtarget` for compatibility. This workflow requires the Hugging Face clone and a local PeptiVerse checkout/release because the upstream script imports `./PeptiVerse/inference.py` and `./PeptiVerse/best_models.txt` at startup.
+
+Expected layout:
+
+```text
+moppit/
+  moPPIt/
+    moppit.py
+    ckpt/peptide/cnn_epoch200_lr0.0001_embed512_hidden256_loss3.1051.ckpt
+    classifier_ckpt/finetuned_BindEvaluator.ckpt
+    classifier_ckpt/best_model_half_life.pth
+    classifier_ckpt/best_model_nonfouling.json
+    classifier_ckpt/best_model_solubility.json
+    classifier_ckpt/binding_affinity_pooled.pt
+    classifier_ckpt/binding_affinity_unpooled.pt
+    classifier_ckpt/wt_affinity.pt
+    classifier_ckpt/wt_halflife.pt
+    classifier_ckpt/wt_hemolysis.json
+    classifier_ckpt/wt_nonfouling.pt
+    PeptiVerse/
+      inference.py
+      best_models.txt
+      training_classifiers/...
+```
+
+Set it up with:
+
+```bash
+python -m pip install -e ".[mogdfm]"
+
+git lfs install
+git clone https://huggingface.co/ChatterjeeLab/moPPIt moPPIt
+cd moPPIt
+git lfs pull
+cd ..
+
+# Place or clone PeptiVerse here so these files exist:
+# moPPIt/PeptiVerse/inference.py
+# moPPIt/PeptiVerse/best_models.txt
+```
+
+Validate the MOG-DFM setup without generating peptides:
+
+```bash
+moppit-mog-dfm --dry-run \
+  --hf-root moPPIt \
+  --output_file samples.csv \
+  --length 10 \
+  --objectives Hemolysis Motif Specificity \
+  --target_protein MHVPSGAQLGLRPDLLARRRLKRCPSRWLCLSAAWSFVQVFSEPDGFTVIFSGLGNNAGGTMHWNDTRPAHFRILKVVLREAVAECLMDSYSLDVHGGRRTAAG
+```
+
+If an asset is still a Git LFS pointer or `PeptiVerse/` is missing, the command reports all missing prerequisites before attempting to import the HF script. The preflight also checks bundled Hugging Face classifier assets under `moPPIt/classifier_ckpt/` when they are present, so stale LFS pointer files are caught before generation starts.
+
+You can keep the Hugging Face clone somewhere else by passing `--hf-root /path/to/moPPIt` or setting:
+
+```bash
+export MOPPIT_HF_ROOT=/path/to/moPPIt
+```
+
+## 0.5 First Commands After Setup
+
+Predict binding residues for a known target/binder pair:
+
+```bash
+moppit-predict \
+  --model model_path/finetuned_BindEvaluator.ckpt \
+  --target TARGET_PROTEIN_SEQUENCE \
+  --binder BINDER_SEQUENCE \
+  --motifs 18,23,59-61 \
+  --output predicted_sites.json
+```
+
+Design motif-specific binders with the default PepMLM plus genetic-algorithm workflow:
+
+```bash
+moppit-generate \
+  --model model_path/finetuned_BindEvaluator.ckpt \
+  --protein-seq TARGET_PROTEIN_SEQUENCE \
+  --peptide-length 11 \
+  --motif 18,23,59-61 \
+  --num-binders 50 \
+  --num-display 10 \
+  --output generated_binders.csv
+```
+
+Design binders with the Hugging Face MOG-DFM multi-objective workflow:
+
+```bash
+moppit-mog-dfm \
+  --hf-root moPPIt \
+  --output_file samples.csv \
+  --length 10 \
+  --n_batches 600 \
+  --weights 1 1 1 4 4 2 \
+  --motifs '16-31,62-79' \
+  --motif_penalty \
+  --objectives Hemolysis Non-Fouling Half-Life Affinity Motif Specificity \
+  --target_protein TARGET_PROTEIN_SEQUENCE
+```
+
+Use 0-based protein residue indices for `moppit-predict`, `moppit-generate`, and `moppit-mog-dfm` unless you explicitly pass `--motif-index-base 1` to `moppit-predict` for outside annotations.
+
+## 0.6 Hugging Face Implementation Notes
+
+The Hugging Face repository is newer than the original GitHub code. The BindEvaluator architecture and module weights are unchanged, so this package keeps the same checkpoint-compatible predictor and adds the safe inference improvements from the Hugging Face code: published 8-layer defaults, `weights_only=False` checkpoint loading, frozen/eval inference loading, motif scoring helpers, and support for the Hugging Face checkpoint path.
+
+The Hugging Face generator is a different research pipeline: Multi-Objective-Guided Discrete Flow Matching with PeptiVerse-guided objectives. It is exposed as `moppit-mog-dfm` so the packaged repo has the same generation feature surface while keeping the lighter PepMLM plus genetic-algorithm generator as `moppit-generate`.
 
 # 1. Dataset Preparation
 
@@ -91,36 +312,116 @@ We provide an example script to use BindEvaluator to predict binding sites (`scr
 
 NOTE: amino acid indices start from 0 on a protein sequence
 
+The published ChatterjeeLab/moPPIt BindEvaluator checkpoints use the default `published` architecture preset (`n_layers=8`, `d_model=128`, `d_hidden=128`, `n_head=8`, `d_inner=64`), so these values do not need to be provided for normal prediction. Use `--checkpoint-preset legacy` or the explicit architecture override flags only for non-published checkpoints.
+
 ``` txt
-usage: moppit-predict -sm MODEL_PATH -target Target -binder Binder
-                        [-gt] [-n_layers] [-d_model] [-d_hidden] [-n_head] [-d_inner]
+usage: moppit-predict [--model MODEL_PATH] --target TARGET --binder BINDER
+                      [--threshold THRESHOLD] [--output OUTPUT.json]
+                      [--device auto|cpu|cuda|cuda:0]
+                      [--checkpoint-preset published|legacy]
+                      [--ground-truth MOTIF] [--motifs MOTIF]
+                      [architecture overrides]
 
 arguments:
-  -sm         The path to the BindEvaluator model weights
-  -target     Target protein sequence
-  -binder     Binder sequence
-  -gt         Ground Truth binding motifs if known. If specified, the prediction accuracy, F1 score, and MCC score will be calculated.
-  -n_layers, -d_model, -d_hidden, -n_head, -d_inner   Model parameters for BindEvaluator, which should be the same as the model specified in -sm used
+  --model, -sm         The path to the BindEvaluator model weights. If omitted, moPPIt checks MOPPIT_BINDEVALUATOR_CKPT, model_path/*.ckpt, classifier_ckpt/finetuned_BindEvaluator.ckpt, and moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt.
+  --target, -target    Target protein sequence
+  --binder, -binder    Binder sequence
+  --ground-truth, -gt  Ground truth binding motifs if known, for example 18,23,59-61. Brackets are optional.
+  --motifs, -motifs    Motif residues to score, using the same motif syntax.
+  --motif-index-base   Index base for --motifs and --ground-truth. Defaults to 0. Use 1 for 1-based motif annotations.
+  --threshold          Binding-site probability threshold, default 0.5
+  --output             Optional JSON file containing predicted residues and per-residue scores
+  --print-scores       Print per-residue prediction probabilities
+  --device             Torch device, default auto
+  --checkpoint-preset  Architecture preset, default published
+  --n-layers, --d-model, --d-hidden, --n-head, --d-inner   Optional overrides for unusual checkpoints
+```
+
+Example:
+
+```bash
+moppit-predict \
+  --model model_path/finetuned_BindEvaluator.ckpt \
+  --target IVEGSDAEIGMSPWQVMLFRKSPQELLCGASLISDRWVLTAAHCLLYPPWDKNFTENDLLVRIGKHSRTRYERNIEKISMLEKIYIHPRYNWRENLDRDIALMKLKKPVAFSDYIHPVCLPDRETAASLLQAGYKGRVTGWGNLKETGQPSVLQVVNLPIVERPVCKDSTRIRITDNMFCAGYKPDEGKRGDACEGDSGGPFVMKSPFNNRWYQMGIVSWGEGCDRDGKYGFYTHVFRLKKWIQKVIDQFGE \
+  --binder GYEEIPEEYLQ \
+  --motifs 18,23,59,67,68,69,70,76,77 \
+  --output predicted_sites.json
 ```
 
 # 4. Motif-Specific Binder Generation
 
 We provide an example script to use moPPIt for generating motif-specific binders based on a target sequence (`scripts/generation.sh`). After installation, use the `moppit-generate` console command. The legacy `python moppit.py` wrapper is still available from the repository checkout.
 ``` txt
-usage: moppit-generate -sm MODEL_PATH --protein_seq PROTEIN --peptide_length LENGTH --motif MOTIF
-                        [--top_k] [--num_binders] [--num_display] [-max_iterations] [-n_layers] [-d_model] [-d_hidden] [-n_head] [-d_inner]
+usage: moppit-generate [--model MODEL_PATH] --protein-seq PROTEIN --peptide-length LENGTH --motif MOTIF
+                       [--top-k TOP_K] [--num-binders NUM_BINDERS]
+                       [--num-display NUM_DISPLAY] [--max-iterations MAX_ITERATIONS]
+                       [--threshold THRESHOLD] [--output OUTPUT.csv]
+                       [--device auto|cpu|cuda|cuda:0]
+                       [--checkpoint-preset published|legacy]
+                       [architecture overrides]
 
 arguments:
-  -sm               The path to the BindEvaluator model weights
-  --protein_seq     Target protein sequence
-  --peptide_length  The length for the generated binders
-  --motif           The binding motifs (NOTE: amino acid indices start from 0 on a protein sequence)
-  --top_k           Sampling argument for each position used in PepMLM
-  --num_binders     The size of the pool of candidates in the genetic algorithm
-  --num_display     The number of top binders to display after each generation
-  -max_iterations   Maximum no improvement iterations
-  -n_layers, -d_model, -d_hidden, -n_head, -d_inner   Model parameters for BindEvaluator, which should be the same as the model specified in -sm used
+  --model, -sm         The path to the BindEvaluator model weights. If omitted, moPPIt checks MOPPIT_BINDEVALUATOR_CKPT, model_path/*.ckpt, classifier_ckpt/finetuned_BindEvaluator.ckpt, and moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt.
+  --protein-seq        Target protein sequence. The old --protein_seq spelling is also accepted.
+  --peptide-length     The length for generated binders. The old --peptide_length spelling is also accepted.
+  --motif              Binding motifs with 0-based indices, for example 18,23,59-61. Brackets are optional.
+  --top-k              Sampling argument for each position used in PepMLM
+  --num-binders        The size of the candidate pool in the genetic algorithm
+  --num-display        The number of top binders to display and write after each generation
+  --max-iterations     Maximum no-improvement iterations
+  --threshold          Binding-site probability threshold used by the motif score, default 0.5
+  --output             Optional CSV file containing the final displayed binders, scores, and pseudo-perplexities
+  --device             Torch device, default auto
+  --checkpoint-preset  Architecture preset, default published
+  --n-layers, --d-model, --d-hidden, --n-head, --d-inner   Optional overrides for unusual checkpoints
 ```
+
+Example:
+
+```bash
+moppit-generate \
+  --model model_path/finetuned_BindEvaluator.ckpt \
+  --protein-seq IVEGSDAEIGMSPWQVMLFRKSPQELLCGASLISDRWVLTAAHCLLYPPWDKNFTENDLLVRIGKHSRTRYERNIEKISMLEKIYIHPRYNWRENLDRDIALMKLKKPVAFSDYIHPVCLPDRETAASLLQAGYKGRVTGWGNLKETGQPSVLQVVNLPIVERPVCKDSTRIRITDNMFCAGYKPDEGKRGDACEGDSGGPFVMKSPFNNRWYQMGIVSWGEGCDRDGKYGFYTHVFRLKKWIQKVIDQFGE \
+  --peptide-length 11 \
+  --motif 18,23,59,67,68,69,70,76,77 \
+  --num-binders 50 \
+  --num-display 10 \
+  --output generated_binders.csv
+```
+
+`--motif` uses 0-based protein residue indices. This matches the original local generator and the Hugging Face MOG-DFM motif parser used by `moppit-mog-dfm`.
+
+The standalone PepMLM helper also accepts the same hyphenated style and can write CSV output:
+
+```bash
+pepmlm-generate \
+  --sequence IVEGSDAEIGMSPWQVMLFRKSPQELLCGASLISDRWVLTAAHCLLYPPWDKNFTENDLLVRIGKHSRTRYERNIEKISMLEKIYIHPRYNWRENLDRDIALMKLKKPVAFSDYIHPVCLPDRETAASLLQAGYKGRVTGWGNLKETGQPSVLQVVNLPIVERPVCKDSTRIRITDNMFCAGYKPDEGKRGDACEGDSGGPFVMKSPFNNRWYQMGIVSWGEGCDRDGKYGFYTHVFRLKKWIQKVIDQFGE \
+  --peptide-length 11 \
+  --top-k 3 \
+  --num-binders 50 \
+  --output pepmlm_binders.csv
+```
+
+## 4.1 Multi-Objective Flow-Matching Generation
+
+For parity with the newer Hugging Face implementation, use `moppit-mog-dfm` to run the MOG-DFM workflow from the local `moPPIt/` clone. It accepts the Hugging Face arguments directly, including `--fixed_positions`, `--cyclic`, `--starting_sequence`, and `--offtarget`. The documented `--motif_penalty` spelling is normalized to the `Specificity` objective.
+
+```bash
+moppit-mog-dfm \
+  --hf-root moPPIt \
+  --output_file './samples.csv' \
+  --length 10 \
+  --n_batches 600 \
+  --weights 1 1 1 4 4 2 \
+  --motifs '16-31,62-79' \
+  --motif_penalty \
+  --objectives Hemolysis Non-Fouling Half-Life Affinity Motif Specificity \
+  --target_protein MHVPSGAQLGLRPDLLARRRLKRCPSRWLCLSAAWSFVQVFSEPDGFTVIFSGLGNNAGGTMHWNDTRPAHFRILKVVLREAVAECLMDSYSLDVHGGRRTAAG
+```
+
+The legacy Hugging Face-style `python -u moo.py ...` command also works from this repository checkout and forwards to `moppit-mog-dfm`.
+
+MOG-DFM motif and fixed-position ranges are also interpreted as 0-based indices by the Hugging Face generation code. The prediction command can additionally accept 1-based motif lists with `--motif-index-base 1` when comparing against outside annotations.
 
 
 # 5. PeptiDerive
@@ -139,7 +440,7 @@ arguments:
 ```
 
 ---
-Please sign the academic-only, non-commercial license to access moPPIt. 
+The newer Hugging Face model card declares `apache-2.0`; verify the current upstream terms for the exact checkpoint or asset you use.
 
 ## Repository Authors
 

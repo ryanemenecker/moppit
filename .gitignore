@@ -5,4 +5,8 @@ build/
 dist/
 .venv/
 wandb/
+/moPPIt/
 *.ckpt
+*.pt
+*.pth
+*.safetensors

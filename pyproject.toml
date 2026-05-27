@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Motif-specific peptide binder prediction and generation with moPPIt."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Academic use only; see upstream repository/license terms." }
+license = { text = "Apache-2.0" }
 authors = [
   { name = "Chatterjee Lab" }
 ]
@@ -29,6 +29,11 @@ train = [
   "wandb>=0.17"
 ]
 peptiderive = []
+mogdfm = [
+  "fair-esm>=2.0",
+  "torchdiffeq>=0.2.3",
+  "xgboost>=2.0"
+]
 dev = [
   "pytest>=8",
   "ruff>=0.6"
@@ -39,6 +44,7 @@ moppit-predict = "moppit.predict_motifs:main"
 moppit-generate = "moppit.generation:main_cli"
 pepmlm-generate = "moppit.pepmlm:main"
 moppit-peptiderive = "moppit.peptiderive:main_cli"
+moppit-mog-dfm = "moppit.mogdfm:main"
 
 [tool.setuptools]
 packages = ["moppit", "moppit.models", "models"]

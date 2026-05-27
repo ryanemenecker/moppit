@@ -1,4 +1,7 @@
-from argparse import ArgumentParser
+from argparse import ArgumentParser, SUPPRESS
+import json
+import os
+from pathlib import Path
 
 import pytorch_lightning as pl
 import torch
@@ -11,9 +14,42 @@ from .models import FFN, MultiHeadAttentionSequence, RepeatedModule3
 
 ESM_MODEL_NAME = "facebook/esm2_t33_650M_UR50D"
 DEFAULT_MAX_LENGTH = 40000
+DEFAULT_MODEL_ENV_VAR = "MOPPIT_BINDEVALUATOR_CKPT"
+PUBLISHED_BINDEVALUATOR_CONFIG = {
+    "n_layers": 8,
+    "d_model": 128,
+    "d_hidden": 128,
+    "n_head": 8,
+    "d_k": 64,
+    "d_v": 128,
+    "d_inner": 64,
+}
+LEGACY_BINDEVALUATOR_CONFIG = {
+    "n_layers": 6,
+    "d_model": 64,
+    "d_hidden": 128,
+    "n_head": 6,
+    "d_k": 64,
+    "d_v": 128,
+    "d_inner": 64,
+}
+CHECKPOINT_PRESETS = {
+    "published": PUBLISHED_BINDEVALUATOR_CONFIG,
+    "legacy": LEGACY_BINDEVALUATOR_CONFIG,
+}
+DEFAULT_MODEL_CANDIDATES = (
+    Path("model_path/finetuned_BindEvaluator.ckpt"),
+    Path("model_path/pretrained_BindEvaluator.ckpt"),
+    Path("classifier_ckpt/finetuned_BindEvaluator.ckpt"),
+    Path("moPPIt/classifier_ckpt/finetuned_BindEvaluator.ckpt"),
+)
 
 
-def parse_motif(motif: str) -> list[int]:
+def parse_motif(motif: str, index_base: int = 0) -> list[int]:
+    motif = motif.strip().strip("[]")
+    if not motif:
+        return []
+
     parts = motif.split(",")
     residues = []
 
@@ -24,6 +60,11 @@ def parse_motif(motif: str) -> list[int]:
             residues.extend(range(start, end + 1))
         elif part:
             residues.append(int(part))
+
+    if index_base not in (0, 1):
+        raise ValueError("index_base must be 0 or 1")
+    if index_base == 1:
+        residues = [residue - 1 for residue in residues]
 
     return residues
 
@@ -71,6 +112,55 @@ class PeptideModel(pl.LightningModule):
         prot_enc = self.output_projection_prot(prot_enc)
 
         return prot_enc
+
+    def get_probs(self, binder_input_ids, target_input_ids):
+        target_input_ids = target_input_ids.repeat(binder_input_ids.shape[0], 1)
+        binder_attention_mask = torch.ones_like(binder_input_ids)
+        target_attention_mask = torch.ones_like(target_input_ids)
+
+        binder_attention_mask[:, 0] = binder_attention_mask[:, -1] = 0
+        target_attention_mask[:, 0] = target_attention_mask[:, -1] = 0
+
+        binder_tokens = {
+            "input_ids": binder_input_ids,
+            "attention_mask": binder_attention_mask.to(binder_input_ids.device),
+        }
+        target_tokens = {
+            "input_ids": target_input_ids,
+            "attention_mask": target_attention_mask.to(target_input_ids.device),
+        }
+
+        logits = self.forward(binder_tokens, target_tokens).squeeze(-1)
+        logits[:, 0] = logits[:, -1] = -100
+        return torch.sigmoid(logits)
+
+    def motif_score(self, binder_input_ids, target_input_ids, motifs):
+        probs = self.get_probs(binder_input_ids, target_input_ids)
+        motif_probs = probs[:, motifs]
+        return motif_probs.sum(dim=-1) / len(motifs)
+
+    def non_motif_score(self, binder_input_ids, target_input_ids, motifs, threshold=0.5):
+        probs = self.get_probs(binder_input_ids, target_input_ids)
+        non_motif_positions = [index for index in range(probs.shape[1]) if index not in set(motifs)]
+        non_motif_probs = probs[:, non_motif_positions]
+        mask = non_motif_probs >= threshold
+        count = mask.sum(dim=-1)
+        return torch.where(count > 0, (non_motif_probs * mask).sum(dim=-1) / count, torch.zeros_like(count))
+
+    def scoring(self, binder_input_ids, target_input_ids, motifs, penalty=False, threshold=0.5):
+        probs = self.get_probs(binder_input_ids, target_input_ids)
+        motif_probs = probs[:, motifs]
+        motif_score = motif_probs.sum(dim=-1) / len(motifs)
+
+        if penalty:
+            non_motif_positions = [index for index in range(probs.shape[1]) if index not in set(motifs)]
+            non_motif_probs = probs[:, non_motif_positions]
+            mask = non_motif_probs >= threshold
+            count = mask.sum(dim=-1)
+            specificity_score = 1 - count / target_input_ids.shape[1]
+            return motif_score, specificity_score
+
+        return motif_score
 
 
 def _model_device(model: torch.nn.Module) -> torch.device:
@@ -122,18 +212,83 @@ def compute_metrics(true_residues, predicted_residues, length):
     return accuracy, f1, mcc
 
 
+def resolve_device(device="auto"):
+    if device == "auto":
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    return torch.device(device)
+
+
+def resolve_checkpoint_path(model_path=None):
+    if model_path:
+        return model_path
+
+    env_model_path = os.environ.get(DEFAULT_MODEL_ENV_VAR)
+    if env_model_path:
+        return env_model_path
+
+    for candidate in DEFAULT_MODEL_CANDIDATES:
+        if candidate.exists():
+            return str(candidate)
+
+    candidates = ", ".join(str(candidate) for candidate in DEFAULT_MODEL_CANDIDATES)
+    raise FileNotFoundError(
+        "No BindEvaluator checkpoint was provided. Use --model/-sm, set "
+        f"{DEFAULT_MODEL_ENV_VAR}, or place a checkpoint at one of: {candidates}"
+    )
+
+
+def is_git_lfs_pointer(path):
+    path = Path(path)
+    try:
+        header = path.read_bytes()[:128].decode("utf-8", errors="ignore")
+    except OSError:
+        return False
+    return header.startswith("version https://git-lfs.github.com/spec/v1")
+
+
+def validate_checkpoint_path(checkpoint_path):
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"BindEvaluator checkpoint does not exist: {checkpoint_path}")
+    if is_git_lfs_pointer(checkpoint_path):
+        raise ValueError(
+            f"BindEvaluator checkpoint is a Git LFS pointer, not the actual weights: {checkpoint_path}. "
+            "Run `git lfs pull` in the Hugging Face clone or provide a real checkpoint with --model."
+        )
+    return str(checkpoint_path)
+
+
+def resolve_model_config(args):
+    preset_name = getattr(args, "checkpoint_preset", "published")
+    config = dict(CHECKPOINT_PRESETS[preset_name])
+
+    for key in ("n_layers", "d_model", "d_hidden", "n_head", "d_inner"):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+
+    return config
+
+
 def load_bindevaluator_checkpoint(args, device=None):
-    device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    return PeptideModel.load_from_checkpoint(
-        args.sm,
-        n_layers=args.n_layers,
-        d_model=args.d_model,
-        d_hidden=args.d_hidden,
-        n_head=args.n_head,
-        d_k=64,
-        d_v=128,
-        d_inner=args.d_inner,
+    device = device or resolve_device(getattr(args, "device", "auto"))
+    checkpoint_path = validate_checkpoint_path(resolve_checkpoint_path(getattr(args, "sm", None)))
+    config = resolve_model_config(args)
+    model = PeptideModel.load_from_checkpoint(
+        checkpoint_path,
+        weights_only=False,
+        n_layers=config["n_layers"],
+        d_model=config["d_model"],
+        d_hidden=config["d_hidden"],
+        n_head=config["n_head"],
+        d_k=config["d_k"],
+        d_v=config["d_v"],
+        d_inner=config["d_inner"],
     ).to(device)
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    return model
 
 
 def predict_binding_sites(target_sequence, binder_sequence, model, threshold=0.5):
@@ -145,19 +300,91 @@ def predict_binding_sites(target_sequence, binder_sequence, model, threshold=0.5
     return binding_site, prediction
 
 
+def write_prediction_output(output_path, target_sequence, binder_sequence, binding_site, prediction, threshold,
+                            motif_summary=None):
+    payload = {
+        "target_length": len(target_sequence),
+        "binder_length": len(binder_sequence),
+        "threshold": threshold,
+        "binding_site": binding_site,
+        "scores": [float(score) for score in prediction.detach().cpu().tolist()],
+    }
+    if motif_summary is not None:
+        payload["motif_summary"] = motif_summary
+    Path(output_path).write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def summarize_motif_scores(prediction, motifs, threshold=0.5):
+    motifs = list(motifs)
+    if not motifs:
+        raise ValueError("At least one motif residue is required")
+
+    prediction = prediction.detach().cpu()
+    length = prediction.shape[0]
+    out_of_range = [motif for motif in motifs if motif < 0 or motif >= length]
+    if out_of_range:
+        raise ValueError(f"Motif indices out of range for target length {length}: {out_of_range}")
+
+    motif_tensor = torch.tensor(motifs, dtype=torch.long)
+    motif_score = prediction[motif_tensor].mean().item()
+    non_motif_indices = [index for index in range(length) if index not in set(motifs)]
+
+    if non_motif_indices:
+        non_motif_scores = prediction[torch.tensor(non_motif_indices, dtype=torch.long)]
+        non_motif_hits = int((non_motif_scores >= threshold).sum().item())
+        if non_motif_hits:
+            off_motif_score = non_motif_scores[non_motif_scores >= threshold].mean().item()
+        else:
+            off_motif_score = 0.0
+    else:
+        non_motif_hits = 0
+        off_motif_score = 0.0
+
+    return {
+        "motifs": motifs,
+        "motif_score": motif_score,
+        "off_motif_score": off_motif_score,
+        "off_motif_hits": non_motif_hits,
+        "specificity_score": 1 - (non_motif_hits / length),
+    }
+
+
+def add_checkpoint_arguments(parser):
+    parser.add_argument("-sm", "--model", dest="sm", default=None,
+                        help="BindEvaluator checkpoint path. Defaults to MOPPIT_BINDEVALUATOR_CKPT or model_path/*.ckpt.")
+    parser.add_argument("--checkpoint-preset", choices=sorted(CHECKPOINT_PRESETS), default="published",
+                        help="Architecture preset for loading checkpoints. Use 'published' for ChatterjeeLab/moPPIt weights.")
+    parser.add_argument("-n_layers", "--n-layers", dest="n_layers", type=int, default=None,
+                        help="Override checkpoint preset layer count.")
+    parser.add_argument("-d_model", "--d-model", dest="d_model", type=int, default=None,
+                        help="Override checkpoint preset model dimension.")
+    parser.add_argument("-d_hidden", "--d-hidden", dest="d_hidden", type=int, default=None,
+                        help="Override checkpoint preset CNN hidden dimension.")
+    parser.add_argument("-n_head", "--n-head", dest="n_head", type=int, default=None,
+                        help="Override checkpoint preset attention head count.")
+    parser.add_argument("-d_inner", "--d-inner", dest="d_inner", type=int, default=None,
+                        help="Override checkpoint preset feed-forward dimension.")
+    parser.add_argument("--device", default="auto",
+                        help="Torch device to use, such as auto, cpu, cuda, or cuda:0.")
+    return parser
+
+
 def build_parser():
     parser = ArgumentParser()
-    parser.add_argument("-sm", required=True, help="File containing initial params", type=str)
-    parser.add_argument("-batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("-lr", type=float, default=1e-3)
-    parser.add_argument("-n_layers", type=int, default=6, help="Number of layers")
-    parser.add_argument("-d_model", type=int, default=64, help="Dimension of model")
-    parser.add_argument("-d_hidden", type=int, default=128, help="Dimension of CNN block")
-    parser.add_argument("-n_head", type=int, default=6, help="Number of heads")
-    parser.add_argument("-d_inner", type=int, default=64)
-    parser.add_argument("-target", type=str)
-    parser.add_argument("-binder", type=str)
-    parser.add_argument("-gt", type=str, default=None, help="Ground Truth binding motifs")
+    add_checkpoint_arguments(parser)
+    parser.add_argument("-target", "--target", required=True, type=str)
+    parser.add_argument("-binder", "--binder", required=True, type=str)
+    parser.add_argument("-gt", "--ground-truth", dest="gt", type=str, default=None,
+                        help="Ground truth binding motifs, for example '1,4-6'.")
+    parser.add_argument("-motifs", "--motifs", "--motif", dest="motifs", type=str, default=None,
+                        help="Motif residues to score, for example '18,23,59-61'.")
+    parser.add_argument("--motif-index-base", type=int, choices=[0, 1], default=0,
+                        help="Index base for --motifs and --ground-truth. Defaults to 0 for original moPPIt behavior.")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Binding-site probability threshold.")
+    parser.add_argument("--output", type=str, default=None, help="Optional JSON file for scores and predicted residues.")
+    parser.add_argument("--print-scores", action="store_true", help="Print per-residue prediction probabilities.")
+    parser.add_argument("-batch_size", type=int, default=None, help=SUPPRESS)
+    parser.add_argument("-lr", type=float, default=None, help=SUPPRESS)
     return parser
 
 
@@ -165,20 +392,41 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    model = load_bindevaluator_checkpoint(args)
-    binding_site, prediction = predict_binding_sites(args.target, args.binder, model)
+    try:
+        model = load_bindevaluator_checkpoint(args)
+    except (FileNotFoundError, ValueError) as error:
+        parser.error(str(error))
+
+    binding_site, prediction = predict_binding_sites(args.target, args.binder, model, threshold=args.threshold)
 
     print("Prediction: ", binding_site)
 
+    if args.print_scores:
+        scores = [round(float(score), 4) for score in prediction.detach().cpu().tolist()]
+        print("Scores: ", scores)
+
+    motif_summary = None
+    if args.motifs is not None:
+        try:
+            motifs = parse_motif(args.motifs, index_base=args.motif_index_base)
+            motif_summary = summarize_motif_scores(prediction, motifs, threshold=args.threshold)
+        except ValueError as error:
+            parser.error(str(error))
+        print(f"Motif Score: {motif_summary['motif_score']:.4f}")
+        print(f"Specificity Score: {motif_summary['specificity_score']:.4f}")
+        print(f"Off-Motif Hits: {motif_summary['off_motif_hits']}")
+
+    if args.output is not None:
+        write_prediction_output(args.output, args.target, args.binder, binding_site, prediction, args.threshold,
+                                motif_summary=motif_summary)
+
     if args.gt is not None:
         length = len(args.target)
-        ground_truth = parse_motif(args.gt)
+        ground_truth = parse_motif(args.gt, index_base=args.motif_index_base)
         print("Ground Truth: ", ground_truth)
 
         accuracy, f1, mcc = compute_metrics(ground_truth, binding_site, length)
         print(f"Accuracy={accuracy}\tF1={f1}\tMCC={mcc}")
-
-    return prediction
 
 
 if __name__ == "__main__":
