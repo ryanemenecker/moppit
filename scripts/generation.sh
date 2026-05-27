@@ -1,5 +1,7 @@
 export CUDA_VISIBLE_DEVICES=7
 MODEL_DIR="${MOPPIT_MODEL_DIR:-$HOME/model_weights/moppit}"
+SCORE_BATCH_SIZE="${MOPPIT_SCORE_BATCH_SIZE:-32}"
+PPL_BATCH_SIZE="${MOPPIT_PPL_BATCH_SIZE:-1024}"
 
 moppit-generate \
 --model-dir "$MODEL_DIR" \
@@ -9,4 +11,6 @@ moppit-generate \
 --top-k 3 \
 --num-binders 50 \
 --num-display 10 \
+--score-batch-size "$SCORE_BATCH_SIZE" \
+--ppl-batch-size "$PPL_BATCH_SIZE" \
 --output generated_binders.csv

@@ -15,6 +15,8 @@ Motif-specific targeting of protein-protein interactions (PPIs) is crucial for d
 
 **Colab Notebook for PeptiDerive**: [Link](https://colab.research.google.com/drive/1aCODZ-WRwhxr-u8nEB6ZrdrhIOTz7-UF?usp=sharing)
 
+**Primary literature for the recommendations below**: Chen et al., *moPPIt: De Novo Generation of Motif-Specific Binders with Protein Language Models*, bioRxiv 2024, DOI: [10.1101/2024.07.31.606098](https://doi.org/10.1101/2024.07.31.606098). The updated bioRxiv/model-card version is titled *moPPIt: De Novo Generation of Motif-Specific and Functionally Active Peptide Binders via Discrete Flow Matching* and uses the same DOI.
+
 ---
 
 # 0. Complete Local Setup
@@ -270,6 +272,8 @@ moppit-generate \
   --motif 18,23,59-61 \
   --num-binders 50 \
   --num-display 10 \
+  --score-batch-size 32 \
+  --ppl-batch-size 1024 \
   --output generated_binders.csv
 ```
 
@@ -396,6 +400,9 @@ arguments:
   --num-display        The number of top binders to display and write after each generation
   --max-iterations     Maximum no-improvement iterations
   --threshold          Binding-site probability threshold used by the motif score, default 0.5
+  --score-batch-size   BindEvaluator candidate scoring batch size. Increase on large GPUs.
+  --ppl-batch-size     PepMLM masked-position batch size for pseudo-perplexity. Increase on large GPUs.
+  --quiet-progress     Disable progress updates during generation.
   --output             Optional CSV file containing the final displayed binders, scores, and pseudo-perplexities
   --device             Torch device, default auto
   --checkpoint-preset  Architecture preset, default published
@@ -411,10 +418,46 @@ moppit-generate \
   --motif 18,23,59,67,68,69,70,76,77 \
   --num-binders 50 \
   --num-display 10 \
+  --score-batch-size 32 \
+  --ppl-batch-size 1024 \
   --output generated_binders.csv
 ```
 
 `--motif` uses 0-based protein residue indices. This matches the original local generator and the Hugging Face MOG-DFM motif parser used by `moppit-mog-dfm`.
+
+`moppit-generate` prints progress lines while it samples the initial PepMLM pool, scores candidates with BindEvaluator, computes PepMLM pseudo-perplexity, and advances each genetic-algorithm generation. Use `--quiet-progress` to suppress these updates.
+
+Throughput is controlled by two batch-size flags. `--score-batch-size` batches candidate binders through BindEvaluator. `--ppl-batch-size` batches masked positions for pseudo-perplexity; for example, 100 binders of length 100 require 10,000 masked-position evaluations, so this flag is usually the biggest speed lever.
+
+## 4.1 Recommended Inputs and GPU Settings
+
+The ranges below are practical starting points based on the moPPIt paper/model card, the official examples, and the model context limits. The paper frames moPPIt as a sequence-only method for motif-specific binders against domains, IDRs, and functional motifs. The older local GA example uses an 11-residue peptide and a 9-residue motif. The newer Hugging Face MOG-DFM example uses `--length 10`, `--n_batches 600`, and a discontinuous motif spanning `16-31,62-79`.
+
+| Setting | Recommended starting values | Guidance |
+| --- | --- | --- |
+| `--peptide-length` / MOG-DFM `--length` | Start with 10-15 residues. Use 8-20 for routine exploration. | This matches the official examples more closely than very long binders. Lengths above 20-30 are better reserved for a specific biological reason. A 100-residue design is closer to a miniprotein design problem and is far outside the demonstrated command examples; it will also make pseudo-perplexity about 10x more expensive than a 10-mer at the same pool size. |
+| `--num-binders` | Start with 50. On a 96 GB Blackwell GPU, 100 is a good first larger run. | This is the GA candidate pool size, not the final number of binders. For broad sweeps, try 200-500 only after a smaller pilot run looks sensible. Keep `--num-display` around 10 or the top 10-20% of the pool. |
+| `--motif` residue count | Use 5-15 residues for a compact epitope or hotspot. Use 10-35 residues for a domain-level or discontinuous motif. | Very small motifs, especially 1-2 residues, are usually underconstrained. Very large motifs, especially above 40 residues, can overconstrain specificity unless the goal is broad domain/region targeting. Discontinuous motifs are supported with comma-separated ranges. |
+| `--protein-seq` / MOG-DFM `--target_protein` | Prefer the target domain or local region containing the motif plus relevant context. Use full length only when it is short enough and off-motif penalties across the whole submitted sequence matter. | moPPIt is sequence-based; the paper demonstrates targeting domains, IDRs, and functional motifs, so the submitted sequence does not have to be a full UniProt entry. For `moppit-generate`, PepMLM concatenates the target and peptide, so `len(protein_seq) + peptide_length` must be at most about 1024 residues. BindEvaluator and MOG-DFM target tokenization also use ESM-2, so keep the submitted target sequence at or below about 1024 residues. If you submit a cropped domain or window, reindex motif residues to that submitted sequence. |
+| `--score-batch-size` on a 96 GB Blackwell GPU | Start at 32 for domain-length targets; try 64 for short targets. | This controls how many candidate binders are scored by BindEvaluator per forward pass. Lower it if target sequences are long or if CUDA memory spikes. |
+| `--ppl-batch-size` on a 96 GB Blackwell GPU | Start at 1024. Try 2048-4096 for short targets; use 128-512 for targets near the 1024-residue limit. | This is usually the main throughput lever because pseudo-perplexity masks every binder residue. Memory scales with this batch size and with target-plus-peptide context length. Lower it first if you hit CUDA out-of-memory. |
+
+For your 96 GB Blackwell setup, a sensible first production run is:
+
+```bash
+moppit-generate \
+  --model ~/model_weights/moppit/finetuned_BindEvaluator.ckpt \
+  --protein-seq TARGET_DOMAIN_OR_LOCAL_REGION \
+  --motif 18,23,59-61 \
+  --peptide-length 11 \
+  --num-binders 100 \
+  --num-display 20 \
+  --score-batch-size 32 \
+  --ppl-batch-size 1024 \
+  --output generated_binders.csv
+```
+
+If the target is short, for example under 100 residues, try `--score-batch-size 64 --ppl-batch-size 2048` or `--ppl-batch-size 4096` after the first run. If the target is several hundred residues, stay closer to `--score-batch-size 32 --ppl-batch-size 1024`. If the submitted target is near the ESM/PepMLM context limit, start conservatively with `--score-batch-size 8 --ppl-batch-size 256`.
 
 The standalone PepMLM helper also accepts the same hyphenated style and can write CSV output:
 
@@ -424,10 +467,11 @@ pepmlm-generate \
   --peptide-length 11 \
   --top-k 3 \
   --num-binders 50 \
+  --ppl-batch-size 1024 \
   --output pepmlm_binders.csv
 ```
 
-## 4.1 Multi-Objective Flow-Matching Generation
+## 4.2 Multi-Objective Flow-Matching Generation
 
 For parity with the newer Hugging Face implementation, use `moppit-mog-dfm` to run the MOG-DFM workflow from the local `moPPIt/` clone. It accepts the Hugging Face arguments directly, including `--fixed_positions`, `--cyclic`, `--starting_sequence`, and `--offtarget`. The documented `--motif_penalty` spelling is normalized to the `Specificity` objective.
 

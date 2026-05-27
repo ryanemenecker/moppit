@@ -14,7 +14,8 @@ from .models import FFN, MultiHeadAttentionSequence, RepeatedModule3
 
 
 ESM_MODEL_NAME = "facebook/esm2_t33_650M_UR50D"
-DEFAULT_MAX_LENGTH = 40000
+ESM_MAX_RESIDUES = 1024
+DEFAULT_MAX_LENGTH = ESM_MAX_RESIDUES + 2
 DEFAULT_MODEL_ENV_VAR = "MOPPIT_BINDEVALUATOR_CKPT"
 DEFAULT_MODEL_DIR_ENV_VAR = "MOPPIT_MODEL_DIR"
 MODEL_DIR_ENV_VARS = (DEFAULT_MODEL_DIR_ENV_VAR, "MOPPIT_MODEL_WEIGHTS_DIR")
@@ -95,6 +96,15 @@ def parse_motif(motif: str, index_base: int = 0) -> list[int]:
         residues = [residue - 1 for residue in residues]
 
     return residues
+
+
+def validate_esm_sequence_length(sequence: str, label: str = "sequence", max_residues: int = ESM_MAX_RESIDUES):
+    if len(sequence) > max_residues:
+        raise ValueError(
+            f"{label} has {len(sequence)} residues, but {ESM_MODEL_NAME} supports about "
+            f"{max_residues} residues after special tokens. Use a target domain or local region "
+            "containing the motif, then reindex motif residues to that submitted sequence."
+        )
 
 
 class PeptideModel(pl.LightningModule):
@@ -213,7 +223,9 @@ def _model_device(model: torch.nn.Module) -> torch.device:
         return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-def _tokenize_sequence(tokenizer, sequence: str, device: torch.device, max_length: int) -> dict[str, torch.Tensor]:
+def _tokenize_sequence(tokenizer, sequence: str, device: torch.device, max_length: int,
+                       label: str = "sequence") -> dict[str, torch.Tensor]:
+    validate_esm_sequence_length(sequence, label)
     tokens = tokenizer(sequence, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
     if tokens["attention_mask"].shape[-1] > 1:
         tokens["attention_mask"][0][0] = 0
@@ -224,12 +236,30 @@ def _tokenize_sequence(tokenizer, sequence: str, device: torch.device, max_lengt
     }
 
 
+def _tokenize_sequences(tokenizer, sequences: list[str], device: torch.device,
+                        max_length: int, label: str = "sequence") -> dict[str, torch.Tensor]:
+    for index, sequence in enumerate(sequences):
+        validate_esm_sequence_length(sequence, f"{label} {index}")
+    tokens = tokenizer(sequences, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
+    attention_mask = tokens["attention_mask"]
+    if attention_mask.shape[-1] > 1:
+        lengths = attention_mask.sum(dim=1).long()
+        attention_mask[:, 0] = 0
+        for row_index, length in enumerate(lengths.tolist()):
+            last_token_index = max(length - 1, 0)
+            attention_mask[row_index][last_token_index] = 0
+    return {
+        "input_ids": tokens["input_ids"].to(device),
+        "attention_mask": attention_mask.to(device),
+    }
+
+
 def calculate_score(target_sequence, binder_sequence, model, args=None, tokenizer=None, max_length=DEFAULT_MAX_LENGTH):
     device = _model_device(model)
     tokenizer = tokenizer or AutoTokenizer.from_pretrained(ESM_MODEL_NAME)
 
-    target_tokens = _tokenize_sequence(tokenizer, target_sequence, device, max_length)
-    binder_tokens = _tokenize_sequence(tokenizer, binder_sequence, device, max_length)
+    target_tokens = _tokenize_sequence(tokenizer, target_sequence, device, max_length, "target sequence")
+    binder_tokens = _tokenize_sequence(tokenizer, binder_sequence, device, max_length, "binder sequence")
 
     model.eval()
     with torch.inference_mode():
@@ -237,6 +267,35 @@ def calculate_score(target_sequence, binder_sequence, model, args=None, tokenize
         prediction = torch.sigmoid(prediction)
 
     return prediction, model.classification_threshold
+
+
+def calculate_scores(target_sequence, binder_sequences, model, args=None, tokenizer=None,
+                     max_length=DEFAULT_MAX_LENGTH, batch_size=8, progress_callback=None):
+    binder_sequences = list(binder_sequences)
+    if not binder_sequences:
+        return []
+
+    device = _model_device(model)
+    tokenizer = tokenizer or AutoTokenizer.from_pretrained(ESM_MODEL_NAME)
+    batch_size = max(int(batch_size or 1), 1)
+    predictions = []
+
+    model.eval()
+    for start_index in range(0, len(binder_sequences), batch_size):
+        batch_binders = binder_sequences[start_index:start_index + batch_size]
+        target_tokens = _tokenize_sequences(tokenizer, [target_sequence] * len(batch_binders), device, max_length,
+                            "target sequence")
+        binder_tokens = _tokenize_sequences(tokenizer, batch_binders, device, max_length, "binder sequence")
+
+        with torch.inference_mode():
+            batch_prediction = model(binder_tokens, target_tokens).squeeze(-1)[:, 1:-1]
+            batch_prediction = torch.sigmoid(batch_prediction)
+
+        predictions.extend(batch_prediction.detach().cpu())
+        if progress_callback is not None:
+            progress_callback(min(start_index + len(batch_binders), len(binder_sequences)), len(binder_sequences))
+
+    return predictions
 
 
 def compute_metrics(true_residues, predicted_residues, length):

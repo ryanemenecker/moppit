@@ -9,12 +9,12 @@ from transformers import AutoModelForMaskedLM, AutoTokenizer
 from .bindevaluator import (
     ESM_MODEL_NAME,
     add_checkpoint_arguments,
-    calculate_score,
+    calculate_scores,
     load_bindevaluator_checkpoint,
     parse_motif,
     resolve_device,
 )
-from .pepmlm import PEPMLM_MODEL_NAME, compute_pseudo_perplexity, generate_peptide
+from .pepmlm import PEPMLM_MODEL_NAME, compute_pseudo_perplexities, generate_peptide, validate_pepmlm_context
 
 
 AA = "ARNDCEQGHILKMFPSTWYV"
@@ -24,33 +24,74 @@ def generate_random_seq(length):
     return "".join(random.choice(AA) for residue_index in range(length))
 
 
-def cal_score(binder_seq, protein_seq, motif, model, args, tokenizer=None):
-    prediction, threshold = calculate_score(protein_seq, binder_seq, model, args, tokenizer=tokenizer)
+def log_progress(args, message):
+    if not getattr(args, "quiet_progress", False):
+        print(f"[moPPIt] {message}", flush=True)
+
+
+def make_progress_callback(args, stage, unit):
+    def progress_callback(done, total):
+        if total <= 0:
+            return
+        percent = (100 * done) / total
+        log_progress(args, f"{stage}: {done}/{total} {unit} ({percent:.1f}%)")
+    return progress_callback
+
+
+def score_prediction(prediction, motif, threshold):
+    motif = list(motif)
+    out_of_range = [position for position in motif if position < 0 or position >= len(prediction)]
+    if out_of_range:
+        raise ValueError(f"Motif indices out of range for target length {len(prediction)}: {out_of_range}")
+
+    motif_set = set(motif)
     score = 0
     for position in motif:
-        if prediction[position] < args.threshold:
+        if prediction[position] < threshold:
             score += 1
 
     for position in range(len(prediction)):
-        if position not in motif and prediction[position] >= args.threshold:
+        if position not in motif_set and prediction[position] >= threshold:
             score += 0.5
 
     return score
 
 
+def cal_score(binder_seq, protein_seq, motif, model, args, tokenizer=None):
+    prediction = calculate_scores(protein_seq, [binder_seq], model, args, tokenizer=tokenizer, batch_size=1)[0]
+    return score_prediction(prediction, motif, args.threshold)
+
+
+def validate_generation_inputs(args):
+    motif = parse_motif(args.motif.strip("[]"))
+    if not motif:
+        raise ValueError("--motif must include at least one target residue.")
+    out_of_range = [position for position in motif if position < 0 or position >= len(args.protein_seq)]
+    if out_of_range:
+        raise ValueError(f"Motif indices out of range for target length {len(args.protein_seq)}: {out_of_range}")
+    if args.num_binders < 1:
+        raise ValueError("--num-binders must be at least 1.")
+    if args.num_display < 1:
+        raise ValueError("--num-display must be at least 1.")
+    if args.score_batch_size < 1:
+        raise ValueError("--score-batch-size must be at least 1.")
+    if args.ppl_batch_size < 1:
+        raise ValueError("--ppl-batch-size must be at least 1.")
+    validate_pepmlm_context(args.protein_seq, args.peptide_length)
+    return motif
+
+
 class Binder(object):
-    def __init__(self, binder_seq, model, pepmlm, pepmlm_tokenizer, bindevaluator_tokenizer, args):
+    def __init__(self, binder_seq, args, score=None, ppl=None):
         self.binder_seq = binder_seq
         self.protein_seq = args.protein_seq
         self.motif = parse_motif(args.motif.strip("[]"))
-        self.model = model
         self.args = args
-        self.pepmlm = pepmlm
-        self.pepmlm_tokenizer = pepmlm_tokenizer
-        self.bindevaluator_tokenizer = bindevaluator_tokenizer
-        self.score = cal_score(binder_seq, self.protein_seq, self.motif, self.model, self.args,
-                               tokenizer=self.bindevaluator_tokenizer)
-        self.ppl = compute_pseudo_perplexity(self.pepmlm, self.pepmlm_tokenizer, self.protein_seq, self.binder_seq)
+        self.score = score
+        self.ppl = ppl
+
+    def is_evaluated(self):
+        return self.score is not None and self.ppl is not None
 
     def mutated_aa(self):
         return random.choice(AA)
@@ -76,17 +117,47 @@ class Binder(object):
             else:
                 child += self.mutated_aa()
 
-        return Binder(child, self.model, self.pepmlm, self.pepmlm_tokenizer, self.bindevaluator_tokenizer, self.args)
+        return Binder(child, self.args)
+
+
+def evaluate_binders(binders, model, pepmlm, pepmlm_tokenizer, bindevaluator_tokenizer, args, stage):
+    pending_binders = [binder for binder in binders if not binder.is_evaluated()]
+    if not pending_binders:
+        return
+
+    binder_sequences = [binder.binder_seq for binder in pending_binders]
+    log_progress(args, f"{stage}: scoring {len(pending_binders)} candidate binders with BindEvaluator "
+                       f"(batch size {args.score_batch_size})")
+    predictions = calculate_scores(args.protein_seq, binder_sequences, model, args,
+                                   tokenizer=bindevaluator_tokenizer,
+                                   batch_size=args.score_batch_size,
+                                   progress_callback=make_progress_callback(args, stage, "BindEvaluator binders"))
+    for binder, prediction in zip(pending_binders, predictions):
+        binder.score = score_prediction(prediction, binder.motif, args.threshold)
+
+    total_masked_positions = sum(len(binder.binder_seq) for binder in pending_binders)
+    log_progress(args, f"{stage}: scoring pseudo-perplexity for {len(pending_binders)} binders "
+                       f"({total_masked_positions} masked positions, batch size {args.ppl_batch_size})")
+    ppl_values = compute_pseudo_perplexities(pepmlm, pepmlm_tokenizer, args.protein_seq, binder_sequences,
+                                            batch_size=args.ppl_batch_size,
+                                            progress_callback=make_progress_callback(args, stage,
+                                                                                    "PepMLM masked positions"))
+    for binder, ppl_value in zip(pending_binders, ppl_values):
+        binder.ppl = ppl_value
 
 
 def main(args):
-    print(parse_motif(args.motif))
+    motif = validate_generation_inputs(args)
     random.seed(args.seed)
     binders = []
     generation = 0
 
     device = resolve_device(args.device)
     print(f"Device: {device}")
+    log_progress(args, f"Starting generation: target length {len(args.protein_seq)}, peptide length "
+                       f"{args.peptide_length}, requested pool {args.num_binders}, score batch size "
+                       f"{args.score_batch_size}, PPL batch size {args.ppl_batch_size}")
+    log_progress(args, f"Motif residues: {motif}")
     model = load_bindevaluator_checkpoint(args, device=device)
 
     tokenizer = AutoTokenizer.from_pretrained(PEPMLM_MODEL_NAME)
@@ -95,13 +166,17 @@ def main(args):
 
     temp_binders = []
     count = 2
+    attempt = 1
     while len(temp_binders) < args.num_binders and count >= 0:
         needed_binders = args.num_binders - len(temp_binders)
+        log_progress(args, f"Initial PepMLM sampling attempt {attempt}/3: requesting {needed_binders} binders")
         temp_binders += generate_peptide(args.protein_seq, args.peptide_length, args.top_k, needed_binders,
-                                         model=pepmlm, tokenizer=tokenizer)["Binder"].tolist()
+                                         model=pepmlm, tokenizer=tokenizer, compute_ppl=False)["Binder"].tolist()
         temp_binders = [sequence for sequence in temp_binders if "X" not in sequence]
         temp_binders = list(set(temp_binders))
+        log_progress(args, f"Initial pool has {len(temp_binders)}/{args.num_binders} unique non-X binders")
         count -= 1
+        attempt += 1
 
     for binder_index in range(0, args.num_binders - len(temp_binders)):
         temp_binders.append(generate_random_seq(args.peptide_length))
@@ -110,7 +185,9 @@ def main(args):
     print(f"Pool Size = {len(temp_binders)}")
 
     for binder_seq in temp_binders:
-        binders.append(Binder(binder_seq, model, pepmlm, tokenizer, bindevaluator_tokenizer, args))
+        binders.append(Binder(binder_seq, args))
+
+    evaluate_binders(binders, model, pepmlm, tokenizer, bindevaluator_tokenizer, args, "Initial pool")
 
     binders = sorted(binders, key=lambda binder: (binder.score, binder.ppl))
     for display_index in range(min(args.num_display, len(binders))):
@@ -121,21 +198,22 @@ def main(args):
 
     no_improvement_generations = 0
     max_tolerance = args.max_iterations
-    threshold = int(0.1 * len(parse_motif(args.motif)))
-
-    print(f"Threshold: {threshold}")
 
     while no_improvement_generations < max_tolerance:
+        log_progress(args, f"Generation {generation}: no-improvement counter "
+                           f"{no_improvement_generations}/{max_tolerance}")
         previous_score = binders[0].score
         previous_ppl = binders[0].ppl
 
         new_binders = []
 
-        selected_count = int((10 * len(binders)) / 100)
+        selected_count = max(int((10 * len(binders)) / 100), 1)
         new_binders.extend(binders[:selected_count])
 
-        offspring_count = int((90 * len(binders)) / 100)
-        half = int(len(binders) / 2)
+        offspring_count = max(len(binders) - selected_count, 0)
+        half = max(int(len(binders) / 2), 1)
+        log_progress(args, f"Generation {generation}: carrying {selected_count} elites and creating "
+                           f"{offspring_count} offspring")
         for offspring_index in range(offspring_count):
             par1 = random.choice(binders[:half])
             par2 = random.choice(binders[:half])
@@ -144,7 +222,10 @@ def main(args):
         for binder_index in range(1, len(new_binders)):
             if new_binders[binder_index].binder_seq == new_binders[binder_index - 1].binder_seq:
                 new_seq = new_binders[binder_index].mutate_seq(new_binders[binder_index].binder_seq)
-                new_binders[binder_index] = Binder(new_seq, model, pepmlm, tokenizer, bindevaluator_tokenizer, args)
+                new_binders[binder_index] = Binder(new_seq, args)
+
+        evaluate_binders(new_binders, model, pepmlm, tokenizer, bindevaluator_tokenizer, args,
+                         f"Generation {generation}")
 
         new_binders = sorted(new_binders, key=lambda binder: (binder.score, binder.ppl))
 
@@ -201,6 +282,12 @@ def build_parser():
     parser.add_argument("--num_display", "--num-display", dest="num_display", type=int, default=1)
     parser.add_argument("-max_iterations", "--max_iterations", "--max-iterations", dest="max_iterations",
                         type=int, default=20, help="Maximum no-improvement iterations")
+    parser.add_argument("--score-batch-size", type=int, default=8,
+                        help="BindEvaluator candidate scoring batch size. Increase on large GPUs.")
+    parser.add_argument("--ppl-batch-size", type=int, default=256,
+                        help="PepMLM masked-position batch size for pseudo-perplexity. Increase on large GPUs.")
+    parser.add_argument("--quiet-progress", action="store_true",
+                        help="Disable progress updates during generation.")
     parser.add_argument("--output", type=str, default=None, help="Optional CSV file for the final displayed binders.")
     parser.add_argument("-batch_size", type=int, default=None, help=SUPPRESS)
     parser.add_argument("-lr", type=float, default=None, help=SUPPRESS)

@@ -3,14 +3,33 @@ from argparse import ArgumentParser
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from torch.distributions.categorical import Categorical
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
 
 PEPMLM_MODEL_NAME = "ChatterjeeLab/PepMLM-650M"
+PEPMLM_MAX_RESIDUES = 1024
 
 _DEFAULT_TOKENIZER = None
 _DEFAULT_MODEL = None
+
+
+def validate_pepmlm_context(protein_seq, peptide_length):
+    peptide_length = int(peptide_length)
+    if peptide_length < 1:
+        raise ValueError("peptide_length must be at least 1.")
+
+    context_length = len(protein_seq) + peptide_length
+    if context_length > PEPMLM_MAX_RESIDUES:
+        raise ValueError(
+            f"PepMLM sees the target and peptide as one sequence. The submitted target length "
+            f"({len(protein_seq)}) plus peptide length ({peptide_length}) is {context_length}, "
+            f"but {PEPMLM_MODEL_NAME} supports about {PEPMLM_MAX_RESIDUES} residues. Use a "
+            "shorter target domain or local region containing the motif, then reindex motif residues "
+            "to that submitted sequence."
+        )
 
 
 def get_default_pepmlm(device=None):
@@ -27,74 +46,148 @@ def get_default_pepmlm(device=None):
     return _DEFAULT_MODEL, _DEFAULT_TOKENIZER
 
 
-def compute_pseudo_perplexity(model, tokenizer, protein_seq, binder_seq):
-    sequence = protein_seq + binder_seq
-    tensor_input = tokenizer.encode(sequence, return_tensors="pt").to(model.device)
-    total_loss = 0
+def _flush_pseudo_perplexity_batch(model, tokenizer, batch_inputs, batch_positions, batch_targets,
+                                   batch_binder_indices, loss_sums, token_counts):
+    if not batch_inputs:
+        return
 
-    for token_index in range(-len(binder_seq) - 1, -1):
-        masked_input = tensor_input.clone()
-        masked_input[0, token_index] = tokenizer.mask_token_id
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id or 1
 
-        labels = torch.full(tensor_input.shape, -100).to(model.device)
-        labels[0, token_index] = tensor_input[0, token_index]
+    input_ids = pad_sequence(batch_inputs, batch_first=True, padding_value=pad_token_id).to(model.device)
+    attention_mask = (input_ids != pad_token_id).long().to(model.device)
+    positions = torch.tensor(batch_positions, dtype=torch.long, device=model.device)
+    targets = torch.tensor(batch_targets, dtype=torch.long, device=model.device)
 
-        with torch.no_grad():
-            outputs = model(masked_input, labels=labels)
-            total_loss += outputs.loss.item()
+    with torch.inference_mode():
+        logits = model(input_ids, attention_mask=attention_mask).logits
+        row_indices = torch.arange(len(batch_positions), device=model.device)
+        losses = F.cross_entropy(logits[row_indices, positions], targets, reduction="none")
 
-    average_loss = total_loss / len(binder_seq)
-    pseudo_perplexity = np.exp(average_loss)
-    return pseudo_perplexity
+    for binder_index, loss in zip(batch_binder_indices, losses.detach().cpu().tolist()):
+        loss_sums[binder_index] += loss
+        token_counts[binder_index] += 1
+
+
+def compute_pseudo_perplexities(model, tokenizer, protein_seq, binder_seqs, batch_size=256, progress_callback=None):
+    binder_seqs = list(binder_seqs)
+    if not binder_seqs:
+        return []
+    for binder_seq in binder_seqs:
+        validate_pepmlm_context(protein_seq, len(binder_seq))
+
+    batch_size = max(int(batch_size or 1), 1)
+    loss_sums = [0.0 for binder_seq in binder_seqs]
+    token_counts = [0 for binder_seq in binder_seqs]
+    total_positions = sum(len(binder_seq) for binder_seq in binder_seqs)
+    processed_positions = 0
+
+    batch_inputs = []
+    batch_positions = []
+    batch_targets = []
+    batch_binder_indices = []
+
+    def flush_batch():
+        nonlocal processed_positions, batch_inputs, batch_positions, batch_targets, batch_binder_indices
+        batch_length = len(batch_inputs)
+        _flush_pseudo_perplexity_batch(model, tokenizer, batch_inputs, batch_positions, batch_targets,
+                                       batch_binder_indices, loss_sums, token_counts)
+        processed_positions += batch_length
+        if progress_callback is not None and batch_length:
+            progress_callback(processed_positions, total_positions)
+        batch_inputs = []
+        batch_positions = []
+        batch_targets = []
+        batch_binder_indices = []
+
+    for binder_index, binder_seq in enumerate(binder_seqs):
+        sequence = protein_seq + binder_seq
+        tensor_input = tokenizer.encode(sequence, return_tensors="pt").squeeze(0).to(model.device)
+        start_position = tensor_input.shape[0] - len(binder_seq) - 1
+        end_position = tensor_input.shape[0] - 1
+
+        for token_position in range(start_position, end_position):
+            masked_input = tensor_input.clone()
+            masked_input[token_position] = tokenizer.mask_token_id
+            batch_inputs.append(masked_input.detach().cpu())
+            batch_positions.append(token_position)
+            batch_targets.append(int(tensor_input[token_position].detach().cpu().item()))
+            batch_binder_indices.append(binder_index)
+
+            if len(batch_inputs) >= batch_size:
+                flush_batch()
+
+    flush_batch()
+
+    return [float(np.exp(loss_sum / max(token_count, 1)))
+            for loss_sum, token_count in zip(loss_sums, token_counts)]
+
+
+def compute_pseudo_perplexity(model, tokenizer, protein_seq, binder_seq, batch_size=256):
+    return compute_pseudo_perplexities(model, tokenizer, protein_seq, [binder_seq], batch_size=batch_size)[0]
 
 
 def generate_peptide_for_single_sequence(protein_seq, peptide_length=15, top_k=3, num_binders=4,
-                                         model=None, tokenizer=None):
+                                         model=None, tokenizer=None, compute_ppl=True, ppl_batch_size=256,
+                                         progress_callback=None):
     peptide_length = int(peptide_length)
     top_k = int(top_k)
     num_binders = int(num_binders)
+    validate_pepmlm_context(protein_seq, peptide_length)
 
     if model is None or tokenizer is None:
         model, tokenizer = get_default_pepmlm()
 
-    binders_with_ppl = []
+    masked_peptide = "<mask>" * peptide_length
+    input_sequence = protein_seq + masked_peptide
+    inputs = tokenizer(input_sequence, return_tensors="pt").to(model.device)
 
-    for binder_index in range(num_binders):
-        masked_peptide = "<mask>" * peptide_length
-        input_sequence = protein_seq + masked_peptide
-        inputs = tokenizer(input_sequence, return_tensors="pt").to(model.device)
+    with torch.inference_mode():
+        logits = model(**inputs).logits
+    mask_token_indices = (inputs["input_ids"] == tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
+    logits_at_masks = logits[0, mask_token_indices]
 
-        with torch.no_grad():
-            logits = model(**inputs).logits
-        mask_token_indices = (inputs["input_ids"] == tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
-        logits_at_masks = logits[0, mask_token_indices]
+    top_k_logits, top_k_indices = logits_at_masks.topk(top_k, dim=-1)
+    probabilities = torch.nn.functional.softmax(top_k_logits, dim=-1)
+    predicted_indices = Categorical(probabilities).sample((num_binders,))
+    expanded_top_k_indices = top_k_indices.unsqueeze(0).expand(num_binders, -1, -1)
+    predicted_token_ids = expanded_top_k_indices.gather(-1, predicted_indices.unsqueeze(-1)).squeeze(-1)
 
-        top_k_logits, top_k_indices = logits_at_masks.topk(top_k, dim=-1)
-        probabilities = torch.nn.functional.softmax(top_k_logits, dim=-1)
-        predicted_indices = Categorical(probabilities).sample()
-        predicted_token_ids = top_k_indices.gather(-1, predicted_indices.unsqueeze(-1)).squeeze(-1)
+    generated_binders = [tokenizer.decode(token_ids, skip_special_tokens=True).replace(" ", "")
+                         for token_ids in predicted_token_ids]
+    if compute_ppl:
+        ppl_values = compute_pseudo_perplexities(model, tokenizer, protein_seq, generated_binders,
+                                                batch_size=ppl_batch_size,
+                                                progress_callback=progress_callback)
+    else:
+        ppl_values = [np.nan for generated_binder in generated_binders]
 
-        generated_binder = tokenizer.decode(predicted_token_ids, skip_special_tokens=True).replace(" ", "")
-        ppl_value = compute_pseudo_perplexity(model, tokenizer, protein_seq, generated_binder)
-        binders_with_ppl.append([generated_binder, ppl_value])
+    binders_with_ppl = [[generated_binder, ppl_value]
+                        for generated_binder, ppl_value in zip(generated_binders, ppl_values)]
 
     return binders_with_ppl
 
 
-def generate_peptide(input_seqs, peptide_length=15, top_k=3, num_binders=4, model=None, tokenizer=None):
+def generate_peptide(input_seqs, peptide_length=15, top_k=3, num_binders=4, model=None, tokenizer=None,
+                     compute_ppl=True, ppl_batch_size=256, progress_callback=None):
     if model is None or tokenizer is None:
         model, tokenizer = get_default_pepmlm()
 
     if isinstance(input_seqs, str):
         binders = generate_peptide_for_single_sequence(input_seqs, peptide_length, top_k, num_binders,
-                                                       model=model, tokenizer=tokenizer)
+                                                       model=model, tokenizer=tokenizer, compute_ppl=compute_ppl,
+                                                       ppl_batch_size=ppl_batch_size,
+                                                       progress_callback=progress_callback)
         return pd.DataFrame(binders, columns=["Binder", "Pseudo Perplexity"])
 
     if isinstance(input_seqs, list):
         results = []
         for sequence in input_seqs:
             binders = generate_peptide_for_single_sequence(sequence, peptide_length, top_k, num_binders,
-                                                           model=model, tokenizer=tokenizer)
+                                                           model=model, tokenizer=tokenizer, compute_ppl=compute_ppl,
+                                                           ppl_batch_size=ppl_batch_size,
+                                                           progress_callback=progress_callback)
             for binder, ppl in binders:
                 results.append([sequence, binder, ppl])
         return pd.DataFrame(results, columns=["Input Sequence", "Binder", "Pseudo Perplexity"])
@@ -114,6 +207,8 @@ def build_parser():
     parser.add_argument("--peptide_length", "--peptide-length", dest="peptide_length", type=int, default=13)
     parser.add_argument("--top_k", "--top-k", dest="top_k", type=int, default=2)
     parser.add_argument("--num_binders", "--num-binders", dest="num_binders", type=int, default=50)
+    parser.add_argument("--ppl-batch-size", type=int, default=256,
+                        help="Masked-position batch size for pseudo-perplexity scoring. Increase on large GPUs.")
     parser.add_argument("--device", default="auto", help="Torch device to use, such as auto, cpu, cuda, or cuda:0.")
     parser.add_argument("--output", type=str, default=None, help="Optional CSV file for generated binders.")
     return parser
@@ -124,9 +219,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     device = resolve_device(args.device)
+    validate_pepmlm_context(args.sequence, args.peptide_length)
     model, tokenizer = get_default_pepmlm(device)
     peptide_df = generate_peptide(args.sequence, args.peptide_length, args.top_k, args.num_binders,
-                                  model=model, tokenizer=tokenizer)
+                                  model=model, tokenizer=tokenizer, ppl_batch_size=args.ppl_batch_size)
     peptide_df = peptide_df.drop_duplicates(subset="Binder")
     peptide_df = peptide_df.sort_values(by="Pseudo Perplexity")
     if args.output is not None:
